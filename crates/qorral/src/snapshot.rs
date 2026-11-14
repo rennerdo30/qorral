@@ -36,8 +36,11 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         }
     }
     if let Some(id) = &args.select {
-        ui.selected = Some(id.clone());
-        ui.set_vms(ui.vms.clone());
+        ui.select_id(id);
+    }
+    if args.details {
+        ui.details_open = true;
+        ui.resize(w, h, scale);
     }
     if let Some(q) = &args.query {
         ui.text(q);

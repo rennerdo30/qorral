@@ -1,10 +1,16 @@
-//! The library screen: every machine at a glance (live screens, state,
-//! hardware), one search field for machines and new installs, and a detail
-//! pane for the selected machine.
+//! Qorral's main screen: the **stage**, the **dock** and the **intent bar**.
+//!
+//! - Stage: the focused machine's live screen, large, in a bezel lit by its
+//!   own colours; name, state and the real controls under it; a details
+//!   drawer with hardware and the exact QEMU command.
+//! - Dock: every machine as a live tile along the bottom, plus "New".
+//! - Intent bar: plain words become actions ("fedora 16gb vulkan",
+//!   "start arch"); the arrow keys and Enter run the results.
 //!
 //! The UI owns no I/O. It paints from data it was given, records damage, and
 //! hands user intents to the window loop as [`Action`]s.
 
+use crate::intent::{self, Draft, Intent, Verb};
 use crate::theme as th;
 use qorral_core::{GpuMode, OsKind};
 use qorral_render::{Canvas, FontId, Rect, TextEngine, mix};
@@ -25,12 +31,29 @@ pub struct Thumb {
     pub rgba: Vec<u8>,
 }
 
+impl Thumb {
+    /// The screen's average colour (sampled), for the stage light.
+    pub fn average(&self) -> u32 {
+        let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+        let step = (self.rgba.len() / 4 / 4096).max(1) * 4;
+        for p in self.rgba.as_chunks::<4>().0.iter().step_by(step / 4) {
+            r += p[0] as u64;
+            g += p[1] as u64;
+            b += p[2] as u64;
+            n += 1;
+        }
+        if n == 0 {
+            return th::ACCENT;
+        }
+        ((r / n) as u32) << 16 | ((g / n) as u32) << 8 | (b / n) as u32
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VmView {
     pub id: String,
     pub name: String,
     pub os: OsKind,
-    /// "Fedora 43 Workstation", or the OS family when unknown.
     pub os_label: String,
     pub cpus: u32,
     pub memory_mib: u32,
@@ -62,10 +85,8 @@ pub enum Action {
         id: String,
         force: bool,
     },
-    /// Pick an install medium and create a machine; the preset fills in defaults.
-    NewFromIso {
-        preset: Option<&'static str>,
-    },
+    /// Ask for an install image, then create the machine from the draft.
+    Create(Draft),
 }
 
 /// How the window frame looks.
@@ -109,13 +130,15 @@ pub struct TitleGeometry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
-    Search,
-    New,
-    Card(usize),
-    CardPrimary(usize),
+    Bar,
+    Result(usize),
+    Screen,
     Primary,
     Secondary,
-    Tile(usize),
+    Details,
+    Dock(usize),
+    DockNew,
+    Suggest(usize),
 }
 
 pub struct Fonts {
@@ -159,13 +182,13 @@ pub fn load_fonts(te: &mut TextEngine) -> Option<Fonts> {
     Some(Fonts { regular, semi, mono })
 }
 
-/// The OS tiles shown when the library is empty (factual OS names only).
-pub const TILES: [(&str, &str, &str); 5] = [
-    ("ubuntu", "Ubuntu", "Desktop"),
-    ("fedora", "Fedora", "Workstation"),
-    ("debian", "Debian", "Stable"),
-    ("arch", "Arch Linux", "Rolling"),
-    ("windows-11", "Windows 11", "Tuned for setup"),
+/// Systems suggested on an empty library (factual OS names only).
+pub const TILES: [(&str, &str); 5] = [
+    ("ubuntu", "Ubuntu"),
+    ("fedora", "Fedora"),
+    ("debian", "Debian"),
+    ("arch", "Arch Linux"),
+    ("windows-11", "Windows 11"),
 ];
 
 #[derive(Default)]
@@ -186,12 +209,18 @@ pub struct Ui {
     pub host: HostInfo,
     pub vms: Vec<VmView>,
     pub query: String,
-    search_focus: bool,
+    bar_focus: bool,
+    results: Vec<Intent>,
+    result_sel: usize,
     hover: Option<Hit>,
     pressed: Option<Hit>,
     pub selected: Option<String>,
+    pub details_open: bool,
     pub toast: Option<String>,
     pub now: u64,
+    /// Stage light colour: the focused screen's average, fixed per focus so a
+    /// changing screen never leaves seams in the light.
+    glow: u32,
     hits: Vec<(Rect, Hit)>,
     damage: Vec<Rect>,
     actions: Vec<Action>,
@@ -199,7 +228,6 @@ pub struct Ui {
     pub chrome: Chrome,
     cap_hover: Option<u8>,
     cap_pressed: Option<u8>,
-    /// Maximise button (hovered, pressed), reported by the frame.
     max_state: (bool, bool),
     maximized: bool,
     active: bool,
@@ -218,12 +246,16 @@ impl Ui {
             host: HostInfo::default(),
             vms: Vec::new(),
             query: String::new(),
-            search_focus: false,
+            bar_focus: false,
+            results: Vec::new(),
+            result_sel: 0,
             hover: None,
             pressed: None,
             selected: None,
+            details_open: false,
             toast: None,
             now: 0,
+            glow: th::ACCENT,
             hits: Vec::new(),
             damage: Vec::new(),
             actions: Vec::new(),
@@ -263,8 +295,7 @@ impl Ui {
         self.w = w as i32;
         self.h = h as i32;
         self.scale = scale;
-        self.layout();
-        self.invalidate();
+        self.relayout();
     }
 
     pub fn set_remote(&mut self, remote: bool) {
@@ -274,64 +305,92 @@ impl Ui {
         }
     }
 
-    /// New machine list from the library. Everything is repainted only when
-    /// something visible changed.
     pub fn set_vms(&mut self, vms: Vec<VmView>) {
-        if self.selected.as_ref().is_some_and(|s| !vms.iter().any(|v| &v.id == s)) {
-            self.selected = None;
-        }
-        if self.selected.is_none() {
-            self.selected = vms.first().map(|v| v.id.clone());
-        }
+        let keep = self.selected.clone().filter(|s| vms.iter().any(|v| &v.id == s));
+        self.selected = keep.or_else(|| {
+            // Focus the first running machine, else the first one.
+            vms.iter().find(|v| matches!(v.state, RunState::Running { .. })).or(vms.first()).map(|v| v.id.clone())
+        });
         self.vms = vms;
-        self.layout();
-        self.invalidate();
+        self.update_glow();
+        self.refresh_results();
+        self.relayout();
     }
 
-    /// A new guest screen for one machine: damages only that card and the
-    /// detail preview, never the whole window.
+    pub fn select_id(&mut self, id: &str) {
+        if self.vms.iter().any(|v| v.id == id) {
+            self.selected = Some(id.to_string());
+            self.update_glow();
+            self.relayout();
+        }
+    }
+
+    fn update_glow(&mut self) {
+        self.glow = self
+            .selected_vm()
+            .and_then(|v| v.thumb.as_ref())
+            .map(|t| mix(t.average(), th::ACCENT, 60))
+            .unwrap_or(th::ACCENT);
+    }
+
+    /// A new guest screen: damages only the stage screen (when focused) and
+    /// that machine's dock tile.
     pub fn set_thumb(&mut self, id: &str, thumb: Thumb) {
         let Some(i) = self.vms.iter().position(|v| v.id == id) else { return };
+        let first = self.vms[i].thumb.is_none();
+        let old_aspect = self.vms[i].thumb.as_ref().map(|t| (t.w, t.h));
+        let new_aspect = (thumb.w, thumb.h);
         self.vms[i].thumb = Some(thumb);
-        let rects: Vec<Rect> = self
-            .hits
-            .iter()
-            .filter(|(_, h)| *h == Hit::Card(i))
-            .map(|(r, _)| *r)
-            .chain(self.selected_index().filter(|s| *s == i).map(|_| self.preview_rect()))
-            .collect();
-        self.damage.extend(rects);
+        let focused = self.selected_index() == Some(i);
+        if focused && (first || old_aspect != Some(new_aspect)) {
+            // The light and the bezel size follow the first frame.
+            self.update_glow();
+            self.relayout();
+            return;
+        }
+        if focused {
+            let s = self.screen_rect();
+            self.damage.push(s);
+        }
+        let tile = self.hits.iter().find(|(_, h)| *h == Hit::Dock(i)).map(|(r, _)| *r);
+        if let Some(r) = tile {
+            self.damage.push(r);
+        }
     }
 
     pub fn set_toast(&mut self, t: Option<String>) {
         if self.toast != t {
+            let old = self.toast_rect();
             self.toast = t;
+            self.damage.push(old);
             let r = self.toast_rect();
             self.damage.push(r);
         }
     }
 
-    fn visible(&self) -> Vec<usize> {
-        let q = self.query.trim().to_lowercase();
-        (0..self.vms.len())
-            .filter(|&i| {
-                q.is_empty()
-                    || self.vms[i].name.to_lowercase().contains(&q)
-                    || self.vms[i].os_label.to_lowercase().contains(&q)
-            })
-            .collect()
-    }
-
     fn selected_index(&self) -> Option<usize> {
         self.selected.as_ref().and_then(|s| self.vms.iter().position(|v| &v.id == s))
     }
+    fn selected_vm(&self) -> Option<&VmView> {
+        self.selected_index().map(|i| &self.vms[i])
+    }
 
-    // ---------- layout ----------
+    fn relayout(&mut self) {
+        self.layout();
+        self.invalidate();
+    }
+
+    // ---------- geometry ----------
 
     fn bar_h(&self) -> i32 {
-        self.p(60.0)
+        self.p(52.0)
     }
-    /// The three caption buttons (Windows 11 chrome only).
+    fn dock_h(&self) -> i32 {
+        if self.vms.is_empty() { 0 } else { self.p(138.0) }
+    }
+    fn drawer_w(&self) -> i32 {
+        if self.details_open && self.selected_index().is_some() { self.p(400.0).min(self.w / 2) } else { 0 }
+    }
     fn caption_rect(&self) -> Rect {
         if self.chrome != Chrome::Windows11 {
             return Rect::default();
@@ -339,11 +398,126 @@ impl Ui {
         let w = 3 * self.p(46.0);
         Rect::new(self.w - w, 0, w, self.bar_h() - 1)
     }
-
-    /// Left inset for the macOS traffic lights.
     fn mac_inset(&self) -> i32 {
         if self.chrome == Chrome::MacInset { self.p(72.0) } else { 0 }
     }
+    /// The intent bar: in the title row, or centred on an empty stage.
+    fn bar_rect(&self) -> Rect {
+        if self.vms.is_empty() {
+            let w = self.p(680.0).min(self.w - self.p(64.0));
+            let h = self.p(56.0);
+            Rect::new((self.w - w) / 2, self.h / 2 - self.p(40.0), w, h)
+        } else {
+            let w = self.p(620.0).min(self.w - self.p(560.0)).max(self.p(260.0));
+            let h = self.p(36.0);
+            Rect::new((self.w - w) / 2, (self.bar_h() - h) / 2, w, h)
+        }
+    }
+    fn stage_rect(&self) -> Rect {
+        let y = self.bar_h();
+        Rect::new(0, y, self.w - self.drawer_w(), self.h - y - self.dock_h())
+    }
+    /// The guest screen's bezel, fitted to the stage at the guest's aspect.
+    fn bezel_rect(&self) -> Rect {
+        let st = self.stage_rect();
+        let info = self.p(112.0);
+        let (mx, mt) = (self.p(56.0), self.p(30.0));
+        let (aw, ah) = ((st.w - 2 * mx).max(1), (st.h - mt - info).max(1));
+        let (gw, gh) = self.selected_vm().and_then(|v| v.thumb.as_ref()).map_or((16, 10), |t| (t.w as i32, t.h as i32));
+        let pad = self.p(10.0);
+        let k = ((aw - 2 * pad) as f32 / gw as f32).min((ah - 2 * pad) as f32 / gh as f32).max(0.01);
+        let (w, h) = ((gw as f32 * k) as i32 + 2 * pad, (gh as f32 * k) as i32 + 2 * pad);
+        Rect::new(st.x + (st.w - w) / 2, st.y + mt + (ah - h) / 2, w, h)
+    }
+    fn screen_rect(&self) -> Rect {
+        self.bezel_rect().inset(self.p(10.0), self.p(10.0))
+    }
+    fn info_y(&self) -> i32 {
+        self.bezel_rect().bottom() + self.p(22.0)
+    }
+    fn control_rects(&self) -> (Rect, Rect, Rect) {
+        let b = self.bezel_rect();
+        let h = self.p(40.0);
+        let y = self.info_y() + self.p(6.0);
+        let d = Rect::new(b.right() - h, y, h, h);
+        let s = Rect::new(d.x - self.p(10.0) - self.p(176.0), y, self.p(176.0), h);
+        let p = Rect::new(s.x - self.p(10.0) - self.p(132.0), y, self.p(132.0), h);
+        (p, s, d)
+    }
+    fn dock_tile(&self, n: i32) -> Rect {
+        let (tw, th, gap) = (self.p(158.0), self.p(89.0), self.p(16.0));
+        let y = self.h - self.dock_h() + self.p(16.0);
+        Rect::new(self.p(24.0) + n * (tw + gap), y, tw, th)
+    }
+    fn result_rect(&self, i: usize) -> Rect {
+        let b = self.bar_rect();
+        let rh = self.p(60.0);
+        Rect::new(b.x, b.bottom() + self.p(8.0) + self.p(6.0) + i as i32 * rh, b.w, rh)
+    }
+    fn results_panel(&self) -> Rect {
+        let b = self.bar_rect();
+        let n = self.results.len() as i32;
+        Rect::new(b.x, b.bottom() + self.p(8.0), b.w, n * self.p(60.0) + self.p(12.0))
+    }
+    fn results_open(&self) -> bool {
+        self.bar_focus && !self.results.is_empty()
+    }
+    fn suggest_rects(&self) -> Vec<Rect> {
+        let b = self.bar_rect();
+        let (h, gap) = (self.p(40.0), self.p(10.0));
+        let widths: Vec<i32> = TILES
+            .iter()
+            .map(|t| t.1)
+            .chain(["Any ISO file…"])
+            .map(|n| (n.chars().count() as f32 * self.fs(7.6) + self.fs(64.0)) as i32)
+            .collect();
+        let total: i32 = widths.iter().sum::<i32>() + gap * (widths.len() as i32 - 1);
+        let mut x = self.w / 2 - total / 2;
+        let y = b.bottom() + self.p(28.0);
+        widths
+            .into_iter()
+            .map(|w| {
+                let r = Rect::new(x, y, w, h);
+                x += w + gap;
+                r
+            })
+            .collect()
+    }
+    fn toast_rect(&self) -> Rect {
+        let w = self.p(560.0).min(self.w - self.p(40.0));
+        let bottom = self.h - self.dock_h() - self.p(18.0);
+        Rect::new((self.w - w) / 2, bottom - self.p(44.0), w, self.p(44.0))
+    }
+
+    fn layout(&mut self) {
+        let mut hits = Vec::new();
+        if self.results_open() {
+            for i in 0..self.results.len() {
+                hits.push((self.result_rect(i), Hit::Result(i)));
+            }
+        }
+        hits.push((self.bar_rect(), Hit::Bar));
+        if self.vms.is_empty() {
+            if !self.results_open() {
+                for (i, r) in self.suggest_rects().into_iter().enumerate() {
+                    hits.push((r, Hit::Suggest(i)));
+                }
+            }
+        } else {
+            let (p, s, d) = self.control_rects();
+            hits.push((p, Hit::Primary));
+            hits.push((s, Hit::Secondary));
+            hits.push((d, Hit::Details));
+            hits.push((self.screen_rect(), Hit::Screen));
+            for i in 0..self.vms.len() {
+                hits.push((self.dock_tile(i as i32), Hit::Dock(i)));
+            }
+            hits.push((self.dock_tile(self.vms.len() as i32), Hit::DockNew));
+        }
+        self.hits = hits;
+    }
+
+    // ---------- frame (Windows 11 caption) ----------
 
     fn caption_button_at(&self, x: i32, y: i32) -> Option<u8> {
         let r = self.caption_rect();
@@ -356,16 +530,16 @@ impl Ui {
     pub fn title_geometry(&self) -> TitleGeometry {
         let c = self.caption_rect();
         let bw = c.w / 3;
-        let s = self.search_rect();
+        let b = self.bar_rect();
+        let controls = if self.vms.is_empty() { Vec::new() } else { vec![(b.x, b.right())] };
         TitleGeometry {
             height: self.bar_h(),
-            controls: vec![(s.x, s.right())],
+            controls,
             buttons_left: if c.is_empty() { i32::MAX } else { c.x },
             max_button: (c.x + bw, c.x + 2 * bw),
         }
     }
 
-    /// The frame reported a change of the maximise button or window state.
     pub fn set_frame_state(&mut self, max_state: (bool, bool), maximized: bool) {
         if max_state != self.max_state || maximized != self.maximized {
             self.max_state = max_state;
@@ -381,96 +555,6 @@ impl Ui {
         }
     }
 
-    fn pane_w(&self) -> i32 {
-        if self.selected_index().is_some() && self.w >= self.p(1100.0) { self.p(384.0) } else { 0 }
-    }
-    fn search_rect(&self) -> Rect {
-        let w = self.p(560.0).min(self.w - self.p(520.0)).max(self.p(240.0));
-        let h = self.p(38.0);
-        Rect::new((self.w - w) / 2, (self.bar_h() - h) / 2, w, h)
-    }
-    fn new_rect(&self) -> Rect {
-        let right = self.w - self.pane_w() - self.p(28.0);
-        let w = self.p(148.0);
-        Rect::new(right - w, self.bar_h() + self.p(22.0), w, self.p(36.0))
-    }
-    fn preview_rect(&self) -> Rect {
-        let pw = self.pane_w();
-        let x = self.w - pw + self.p(24.0);
-        let w = pw - self.p(48.0);
-        Rect::new(x, self.bar_h() + self.p(24.0), w, w * 9 / 16)
-    }
-    fn toast_rect(&self) -> Rect {
-        let w = self.p(560.0).min(self.w - self.p(40.0));
-        Rect::new((self.w - self.pane_w() - w) / 2, self.h - self.p(64.0), w, self.p(42.0))
-    }
-    fn grid(&self) -> (i32, i32, i32, i32, i32) {
-        let x0 = self.p(28.0);
-        let avail = self.w - self.pane_w() - 2 * x0;
-        let gap = self.p(18.0);
-        let min_w = self.p(296.0);
-        let cols = ((avail + gap) / (min_w + gap)).max(1);
-        let cw = (avail - gap * (cols - 1)) / cols;
-        let thumb_h = (cw - self.p(16.0)) * 9 / 16;
-        let ch = thumb_h + self.p(84.0);
-        (x0, cols, cw, ch, gap)
-    }
-
-    fn layout(&mut self) {
-        let mut hits = vec![(self.search_rect(), Hit::Search)];
-        let vis = self.visible();
-        if self.vms.is_empty() {
-            for (i, r) in self.tile_rects().into_iter().enumerate() {
-                hits.push((r, Hit::Tile(i)));
-            }
-        } else {
-            hits.push((self.new_rect(), Hit::New));
-            let (x0, cols, cw, ch, gap) = self.grid();
-            let y0 = self.bar_h() + self.p(80.0);
-            for (n, &i) in vis.iter().enumerate() {
-                let (col, row) = (n as i32 % cols, n as i32 / cols);
-                let r = Rect::new(x0 + col * (cw + gap), y0 + row * (ch + gap), cw, ch);
-                hits.push((self.card_button(r), Hit::CardPrimary(i)));
-                hits.push((r, Hit::Card(i)));
-            }
-            if self.pane_w() > 0 {
-                let (a, b) = self.pane_buttons();
-                hits.push((a, Hit::Primary));
-                hits.push((b, Hit::Secondary));
-            }
-        }
-        self.hits = hits;
-    }
-
-    fn thumb_rect(&self, card: Rect) -> Rect {
-        let i = self.p(8.0);
-        let w = card.w - 2 * i;
-        Rect::new(card.x + i, card.y + i, w, w * 9 / 16)
-    }
-    fn card_button(&self, card: Rect) -> Rect {
-        let t = self.thumb_rect(card);
-        let d = self.p(52.0);
-        Rect::new(t.x + (t.w - d) / 2, t.y + (t.h - d) / 2, d, d)
-    }
-    fn pane_buttons(&self) -> (Rect, Rect) {
-        let pv = self.preview_rect();
-        let y = pv.bottom() + self.p(96.0);
-        let h = self.p(38.0);
-        let gap = self.p(10.0);
-        let w = (pv.w - gap) / 2;
-        (Rect::new(pv.x, y, w, h), Rect::new(pv.x + w + gap, y, pv.w - w - gap, h))
-    }
-    fn tile_rects(&self) -> Vec<Rect> {
-        let (tw, th, gap) = (self.p(196.0), self.p(150.0), self.p(16.0));
-        let n = TILES.len() as i32 + 1;
-        let cols = ((self.w - self.p(80.0) + gap) / (tw + gap)).clamp(1, n);
-        let rows = (n + cols - 1) / cols;
-        let total_w = cols * tw + (cols - 1) * gap;
-        let x0 = (self.w - total_w) / 2;
-        let y0 = (self.h / 2 - self.p(40.0)).max(self.bar_h() + self.p(200.0)) - (rows - 1) * (th + gap) / 2;
-        (0..n).map(|i| Rect::new(x0 + (i % cols) * (tw + gap), y0 + (i / cols) * (th + gap), tw, th)).collect()
-    }
-
     // ---------- input ----------
 
     fn hit(&self, x: i32, y: i32) -> Option<Hit> {
@@ -478,11 +562,11 @@ impl Ui {
     }
 
     fn rect_of(&self, h: Hit) -> Option<Rect> {
-        let card = match h {
-            Hit::CardPrimary(i) => Some(Hit::Card(i)),
-            _ => None,
-        };
-        self.hits.iter().find(|(_, x)| *x == card.unwrap_or(h)).map(|(r, _)| *r)
+        match h {
+            // The screen's hover shows the big action and the bezel highlight.
+            Hit::Screen => Some(self.bezel_rect()),
+            _ => self.hits.iter().find(|(_, x)| *x == h).map(|(r, _)| *r),
+        }
     }
 
     pub fn pointer_move(&mut self, x: i32, y: i32) {
@@ -496,6 +580,12 @@ impl Ui {
             let rects: Vec<Rect> = [self.hover, h].into_iter().flatten().filter_map(|h| self.rect_of(h)).collect();
             self.damage.extend(rects);
             self.hover = h;
+            if let Some(Hit::Result(i)) = h
+                && i != self.result_sel
+            {
+                self.result_sel = i;
+                self.damage.push(self.results_panel());
+            }
         }
     }
 
@@ -511,7 +601,16 @@ impl Ui {
     pub fn pointer_cursor_is_hand(&self) -> bool {
         matches!(
             self.hover,
-            Some(Hit::New | Hit::Card(_) | Hit::CardPrimary(_) | Hit::Primary | Hit::Secondary | Hit::Tile(_))
+            Some(
+                Hit::Result(_)
+                    | Hit::Primary
+                    | Hit::Secondary
+                    | Hit::Details
+                    | Hit::Dock(_)
+                    | Hit::DockNew
+                    | Hit::Suggest(_)
+                    | Hit::Screen
+            )
         )
     }
 
@@ -536,124 +635,154 @@ impl Ui {
         }
         let h = self.hit(x, y);
         if h.is_none() || h != self.pressed.take() {
+            if h.is_none() && self.bar_focus {
+                self.set_bar_focus(false);
+            }
             return;
         }
-        let was_focus = self.search_focus;
-        self.search_focus = h == Some(Hit::Search);
-        if was_focus != self.search_focus {
-            self.damage.push(self.search_rect());
+        if h != Some(Hit::Bar) && !matches!(h, Some(Hit::Result(_))) && self.bar_focus {
+            self.set_bar_focus(false);
         }
         match h {
-            Some(Hit::New) => self.actions.push(Action::NewFromIso { preset: None }),
-            Some(Hit::Tile(i)) => {
-                self.actions.push(Action::NewFromIso { preset: TILES.get(i).map(|t| t.0) });
+            Some(Hit::Bar) => self.set_bar_focus(true),
+            Some(Hit::Result(i)) => self.run_result(i),
+            Some(Hit::Screen) | Some(Hit::Primary) => self.primary(),
+            Some(Hit::Secondary) => self.secondary(),
+            Some(Hit::Details) => {
+                self.details_open = !self.details_open;
+                self.relayout();
             }
-            Some(Hit::Card(i)) => self.select(i),
-            Some(Hit::CardPrimary(i)) => {
-                self.select(i);
-                self.primary(i);
+            Some(Hit::Dock(i)) => {
+                let id = self.vms[i].id.clone();
+                self.select_id(&id);
             }
-            Some(Hit::Primary) => {
-                if let Some(i) = self.selected_index() {
-                    self.primary(i)
-                }
+            Some(Hit::DockNew) => {
+                self.query.clear();
+                self.set_bar_focus(true);
             }
-            Some(Hit::Secondary) => {
-                if let Some(i) = self.selected_index() {
-                    self.secondary(i)
-                }
+            Some(Hit::Suggest(i)) => {
+                let preset = TILES.get(i).map(|t| t.0);
+                self.actions.push(Action::Create(Draft { preset, ..Draft::default() }));
             }
-            _ => {}
+            None => {}
         }
     }
 
-    fn select(&mut self, i: usize) {
-        let id = self.vms[i].id.clone();
-        if self.selected.as_deref() != Some(&id) {
-            self.selected = Some(id);
-            self.layout();
-            self.invalidate();
+    fn set_bar_focus(&mut self, on: bool) {
+        if self.bar_focus != on {
+            self.bar_focus = on;
+            self.relayout();
         }
     }
 
-    fn primary(&mut self, i: usize) {
-        let id = self.vms[i].id.clone();
-        match self.vms[i].state {
+    fn primary(&mut self) {
+        let Some(v) = self.selected_vm() else { return };
+        let id = v.id.clone();
+        match v.state {
             RunState::Off | RunState::Failed(_) => self.actions.push(Action::Start { id, window: true }),
             RunState::Running { .. } => self.actions.push(Action::Stop { id, force: false }),
             RunState::Starting | RunState::Stopping => {}
         }
     }
 
-    fn secondary(&mut self, i: usize) {
-        let id = self.vms[i].id.clone();
-        match self.vms[i].state {
+    fn secondary(&mut self) {
+        let Some(v) = self.selected_vm() else { return };
+        let id = v.id.clone();
+        match v.state {
             RunState::Off | RunState::Failed(_) => self.actions.push(Action::Start { id, window: false }),
             RunState::Running { .. } | RunState::Stopping => self.actions.push(Action::Stop { id, force: true }),
             RunState::Starting => {}
         }
     }
 
-    /// Typed text goes to the search field (it filters as you type).
+    fn refresh_results(&mut self) {
+        let names: Vec<(String, bool)> =
+            self.vms.iter().map(|v| (v.name.clone(), matches!(v.state, RunState::Running { .. }))).collect();
+        self.results = intent::parse(&self.query, &names);
+        self.result_sel = self.result_sel.min(self.results.len().saturating_sub(1));
+    }
+
+    fn run_result(&mut self, i: usize) {
+        let Some(r) = self.results.get(i).cloned() else { return };
+        match r {
+            Intent::Create(d) => self.actions.push(Action::Create(d)),
+            Intent::Machine(verb, m) => {
+                let Some(v) = self.vms.get(m) else { return };
+                let id = v.id.clone();
+                self.select_id(&id);
+                match verb {
+                    Verb::Open => {}
+                    Verb::Start => self.actions.push(Action::Start { id, window: true }),
+                    Verb::Stop => self.actions.push(Action::Stop { id, force: false }),
+                    Verb::ForceOff => self.actions.push(Action::Stop { id, force: true }),
+                }
+            }
+        }
+        self.query.clear();
+        self.refresh_results();
+        self.set_bar_focus(false);
+        self.relayout();
+    }
+
+    /// Typed text goes to the intent bar.
     pub fn text(&mut self, s: &str) {
         let s: String = s.chars().filter(|c| !c.is_control()).collect();
         if s.is_empty() {
             return;
         }
-        self.search_focus = true;
+        self.bar_focus = true;
         self.query.push_str(&s);
-        self.after_query();
+        self.result_sel = 0;
+        self.refresh_results();
+        self.relayout();
     }
 
     pub fn key_backspace(&mut self) {
         if self.query.pop().is_some() {
-            self.after_query();
+            self.refresh_results();
+            self.relayout();
         }
     }
 
     pub fn key_escape(&mut self) {
-        if !self.query.is_empty() || self.search_focus {
+        if !self.query.is_empty() || self.bar_focus {
             self.query.clear();
-            self.search_focus = false;
-            self.after_query();
+            self.refresh_results();
+            self.bar_focus = false;
+            self.relayout();
+        } else if self.details_open {
+            self.details_open = false;
+            self.relayout();
         }
     }
 
     pub fn key_focus_search(&mut self) {
-        self.search_focus = true;
-        self.damage.push(self.search_rect());
+        self.set_bar_focus(true);
     }
 
+    /// Left/right walk the dock; up/down walk the results while the bar is open.
     pub fn key_move(&mut self, d: i32) {
-        let vis = self.visible();
-        if vis.is_empty() {
+        if self.results_open() && d.abs() == 2 {
+            let n = self.results.len() as i32;
+            self.result_sel = (self.result_sel as i32 + d.signum()).rem_euclid(n) as usize;
+            self.damage.push(self.results_panel());
             return;
         }
-        let cur = self.selected_index().and_then(|s| vis.iter().position(|&v| v == s));
-        let (_, cols, ..) = self.grid();
-        let step = if d.abs() == 2 { cols * d.signum() } else { d };
-        let n = match cur {
-            Some(c) => (c as i32 + step).clamp(0, vis.len() as i32 - 1) as usize,
-            None => 0,
-        };
-        self.select(vis[n]);
+        if self.vms.is_empty() || d.abs() != 1 {
+            return;
+        }
+        let cur = self.selected_index().unwrap_or(0) as i32;
+        let n = (cur + d).clamp(0, self.vms.len() as i32 - 1) as usize;
+        let id = self.vms[n].id.clone();
+        self.select_id(&id);
     }
 
     pub fn key_enter(&mut self) {
-        if let Some(i) = self.selected_index() {
-            self.primary(i);
+        if self.results_open() {
+            self.run_result(self.result_sel);
+        } else if !self.bar_focus {
+            self.primary();
         }
-    }
-
-    fn after_query(&mut self) {
-        let vis = self.visible();
-        if let Some(&first) = vis.first()
-            && !self.selected_index().is_some_and(|s| vis.contains(&s))
-        {
-            self.selected = Some(self.vms[first].id.clone());
-        }
-        self.layout();
-        self.invalidate();
     }
 
     // ---------- paint ----------
@@ -679,64 +808,102 @@ impl Ui {
 
     fn paint_all(&mut self, cv: &mut Canvas) {
         cv.fill(Rect::new(0, 0, self.w, self.h), th::BG);
-        self.paint_bar(cv);
         if self.vms.is_empty() {
-            self.paint_empty(cv);
+            self.paint_welcome(cv);
         } else {
-            self.paint_library(cv);
-            if self.pane_w() > 0 {
-                self.paint_pane(cv);
+            self.paint_stage(cv);
+            self.paint_dock(cv);
+            if self.drawer_w() > 0 {
+                self.paint_drawer(cv);
             }
+        }
+        self.paint_bar(cv);
+        if self.results_open() {
+            self.paint_results(cv);
         }
         if let Some(t) = self.toast.clone() {
             let r = self.toast_rect();
-            cv.fill_round(r, self.fs(10.0), 0x2A1E22);
-            cv.fill(Rect::new(r.x + self.p(14.0), r.y + r.h / 2 - self.p(4.0), self.p(8.0), self.p(8.0)), th::FAILED);
+            cv.fill_round(r, self.fs(12.0), 0x2A1B20);
+            cv.fill_circle(r.x as f32 + self.fs(20.0), r.y as f32 + r.h as f32 / 2.0, self.fs(4.0), th::FAILED);
             let (f, s) = (self.f.regular, self.fs(13.0));
             self.te.draw_in(
                 cv,
                 f,
                 s,
-                Rect::new(r.x + self.p(22.0), r.y, r.w - self.p(30.0), r.h),
-                self.fs(8.0),
+                Rect::new(r.x + self.p(30.0), r.y, r.w - self.p(40.0), r.h),
+                self.fs(4.0),
                 &t,
                 th::TEXT,
             );
         }
     }
 
+    fn baseline(&self, r: Rect, f: FontId, size: f32) -> f32 {
+        (r.y as f32 + r.h as f32 / 2.0 + self.te.ascent(f, size) * 0.36).round()
+    }
+
     fn paint_bar(&mut self, cv: &mut Canvas) {
+        let semi = self.f.semi;
+        let reg = self.f.regular;
         let bar = Rect::new(0, 0, self.w, self.bar_h());
-        cv.fill(bar, th::BAR);
-        cv.fill(Rect::new(0, bar.bottom() - 1, self.w, 1), th::BORDER);
+        if cv.clip().intersect(bar).is_empty() && cv.clip().intersect(self.bar_rect()).is_empty() {
+            return;
+        }
         // Mark: a rounded square holding a ring with a tail (the Q).
-        let m = self.p(26.0);
-        let mr = Rect::new(self.mac_inset() + self.p(22.0), (bar.h - m) / 2, m, m);
+        let m = self.p(24.0);
+        let mr = Rect::new(self.mac_inset() + self.p(20.0), (bar.h - m) / 2, m, m);
         cv.fill_round(mr, self.fs(7.0), th::ACCENT);
         let (cx, cy) = (mr.x as f32 + m as f32 / 2.0, mr.y as f32 + m as f32 / 2.0);
-        cv.ring(cx, cy, self.fs(6.6), self.fs(2.6), th::ACCENT_TEXT);
+        cv.ring(cx, cy, self.fs(6.0), self.fs(2.4), th::ACCENT_TEXT);
         cv.stroke(
-            &[(cx + self.fs(3.0), cy + self.fs(3.0)), (cx + self.fs(7.2), cy + self.fs(7.2))],
-            self.fs(2.6),
+            &[(cx + self.fs(2.8), cy + self.fs(2.8)), (cx + self.fs(6.6), cy + self.fs(6.6))],
+            self.fs(2.4),
             th::ACCENT_TEXT,
         );
-        let (semi, reg) = (self.f.semi, self.f.regular);
-        let base = (bar.h as f32 / 2.0 + self.te.ascent(semi, self.fs(17.0)) * 0.36).round();
-        self.te.draw(
-            cv,
-            semi,
-            self.fs(17.0),
-            mr.right() as f32 + self.fs(11.0),
-            base,
-            "Qorral",
-            th::TEXT,
-            200.0 * self.scale,
-        );
+        let s16 = self.fs(16.0);
+        let b = (bar.h as f32 / 2.0 + self.te.ascent(semi, s16) * 0.36).round();
+        self.te.draw(cv, semi, s16, mr.right() as f32 + self.fs(10.0), b, "Qorral", th::TEXT, 120.0 * self.scale);
 
-        // Search: filters machines now; finds OS installs once the catalog lands.
-        let s = self.search_rect();
-        let focus = self.search_focus;
-        let hover = self.hover == Some(Hit::Search);
+        // Host status, right-aligned before the caption buttons.
+        let right = if self.caption_rect().is_empty() { self.w } else { self.caption_rect().x };
+        let mut x = right as f32 - self.fs(18.0);
+        let s12 = self.fs(12.0);
+        let hb = (bar.h as f32 / 2.0 + self.te.ascent(reg, s12) * 0.36).round();
+        let items = [
+            (
+                if self.host.qemu_found {
+                    format!("QEMU {}", self.host.qemu_version.clone().unwrap_or_default())
+                } else {
+                    "QEMU not found".to_string()
+                },
+                if self.host.qemu_found { th::RUNNING } else { th::FAILED },
+            ),
+            (self.host.accel.to_uppercase(), th::RUNNING),
+        ];
+        for (text, dot) in items {
+            let w = self.te.measure(reg, s12, &text);
+            x -= w;
+            self.te.draw(cv, reg, s12, x, hb, &text, th::MUTED, w + 2.0);
+            x -= self.fs(9.0);
+            cv.fill_circle(x, bar.h as f32 / 2.0, self.fs(3.0), dot);
+            x -= self.fs(20.0);
+        }
+        self.paint_caption(cv);
+
+        // The intent bar.
+        let r = self.bar_rect();
+        let big = self.vms.is_empty();
+        let focus = self.bar_focus;
+        let hover = self.hover == Some(Hit::Bar);
+        let radius = if big { self.fs(16.0) } else { self.fs(10.0) };
+        if focus && !self.remote {
+            // A soft accent halo while typing.
+            for k in 1..=4 {
+                let o = self.p(k as f32 * 1.5);
+                let ring = Rect::new(r.x - o, r.y - o, r.w + 2 * o, r.h + 2 * o);
+                cv.round_border(ring, radius + o as f32, mix(th::BG, th::ACCENT, 60 / k), th::BG);
+            }
+        }
         let border = if focus {
             th::ACCENT
         } else if hover {
@@ -744,62 +911,48 @@ impl Ui {
         } else {
             th::BORDER
         };
-        cv.round_border(s, self.fs(10.0), border, th::FIELD);
-        let (ix, iy) = (s.x as f32 + self.fs(20.0), s.y as f32 + s.h as f32 / 2.0 - self.fs(1.0));
-        cv.ring(ix, iy, self.fs(6.0), self.fs(1.8), th::MUTED);
-        cv.stroke(
-            &[(ix + self.fs(4.4), iy + self.fs(4.4)), (ix + self.fs(8.2), iy + self.fs(8.2))],
-            self.fs(1.9),
-            th::MUTED,
-        );
-        let text_r = Rect::new(s.x + self.p(34.0), s.y, s.w - self.p(110.0), s.h);
+        cv.round_border(r, radius, border, th::FIELD);
+        let ts = if big { self.fs(17.0) } else { self.fs(13.5) };
+        let ix = r.x as f32 + if big { self.fs(26.0) } else { self.fs(18.0) };
+        let iy = r.y as f32 + r.h as f32 / 2.0;
+        // A prompt chevron, not a magnifier: the bar runs things, it does not only search.
+        let k = if big { self.fs(6.0) } else { self.fs(4.5) };
+        let col = if focus { th::ACCENT } else { th::MUTED };
+        cv.stroke(&[(ix - k * 0.6, iy - k), (ix + k * 0.5, iy), (ix - k * 0.6, iy + k)], self.fs(2.0), col);
+        let text_x = ix + if big { self.fs(20.0) } else { self.fs(16.0) };
+        let text_r = Rect::new(text_x as i32, r.y, r.right() - text_x as i32 - self.p(80.0), r.h);
+        let tb = self.baseline(r, reg, ts);
         if self.query.is_empty() {
-            let hint = if self.vms.is_empty() { "Search…" } else { "Search machines" };
-            self.te.draw_in(cv, reg, self.fs(13.5), text_r, self.fs(4.0), hint, th::FAINT);
-        } else {
-            let q = self.query.clone();
-            let end = self.te.draw_in(cv, reg, self.fs(13.5), text_r, self.fs(4.0), &q, th::TEXT);
+            let hint = if big {
+                "fedora 16gb vulkan, win11 named Build box, any ISO…"
+            } else {
+                "Run, start or create anything"
+            };
+            self.te.draw(cv, reg, ts, text_x, tb, hint, th::FAINT, text_r.w as f32);
             if focus {
                 cv.fill(
-                    Rect::new(end.round() as i32 + 1, s.y + self.p(10.0), self.p(1.5).max(1), s.h - self.p(20.0)),
+                    Rect::new(text_x as i32 - 1, iy as i32 - (ts * 0.6) as i32, self.p(1.5).max(1), (ts * 1.2) as i32),
+                    th::ACCENT,
+                );
+            }
+        } else {
+            let q = self.query.clone();
+            let end = self.te.draw(cv, reg, ts, text_x, tb, &q, th::TEXT, text_r.w as f32);
+            if focus {
+                cv.fill(
+                    Rect::new(end as i32 + 1, iy as i32 - (ts * 0.6) as i32, self.p(1.5).max(1), (ts * 1.2) as i32),
                     th::ACCENT,
                 );
             }
         }
-        if focus && self.query.is_empty() {
-            cv.fill(
-                Rect::new(text_r.x + self.p(4.0), s.y + self.p(10.0), self.p(1.5).max(1), s.h - self.p(20.0)),
-                th::ACCENT,
-            );
-        }
-        // Keycap hint.
-        let kc = Rect::new(s.right() - self.p(62.0), s.y + self.p(8.0), self.p(50.0), s.h - self.p(16.0));
+        let kc_w = self.p(48.0);
+        let kc = Rect::new(r.right() - kc_w - self.p(10.0), r.y + (r.h - self.p(22.0)) / 2, kc_w, self.p(22.0));
         cv.round_border(kc, self.fs(5.0), th::BORDER_STRONG, th::FIELD);
-        let kw = self.te.measure(reg, self.fs(11.0), "Ctrl K");
-        let kb = (kc.y as f32 + kc.h as f32 / 2.0 + self.te.ascent(reg, self.fs(11.0)) * 0.36).round();
-        self.te.draw(cv, reg, self.fs(11.0), kc.x as f32 + (kc.w as f32 - kw) / 2.0, kb, "Ctrl K", th::MUTED, kw + 2.0);
-
-        // Host status, right-aligned: the accelerator and the QEMU build.
-        let right = if self.caption_rect().is_empty() { self.w } else { self.caption_rect().x };
-        let mut x = right as f32 - self.fs(18.0);
-        let (ok, label) = if self.host.qemu_found {
-            (true, format!("QEMU {}", self.host.qemu_version.clone().unwrap_or_default()))
-        } else {
-            (false, "QEMU not found".to_string())
-        };
-        let s13 = self.fs(12.5);
-        let base = (bar.h as f32 / 2.0 + self.te.ascent(reg, s13) * 0.36).round();
-        for (text, dot) in
-            [(label, if ok { th::RUNNING } else { th::FAILED }), (self.host.accel.to_uppercase(), th::RUNNING)]
-        {
-            let w = self.te.measure(reg, s13, &text);
-            x -= w;
-            self.te.draw(cv, reg, s13, x, base, &text, th::MUTED, w + 2.0);
-            x -= self.fs(10.0);
-            cv.fill_circle(x, bar.h as f32 / 2.0, self.fs(3.2), dot);
-            x -= self.fs(22.0);
-        }
-        self.paint_caption(cv);
+        let label = if focus { "Esc" } else { "Ctrl K" };
+        let s11 = self.fs(11.0);
+        let kw = self.te.measure(reg, s11, label);
+        let kb = self.baseline(kc, reg, s11);
+        self.te.draw(cv, reg, s11, kc.x as f32 + (kc.w as f32 - kw) / 2.0, kb, label, th::MUTED, kw + 2.0);
     }
 
     fn paint_caption(&mut self, cv: &mut Canvas) {
@@ -824,7 +977,7 @@ impl Ui {
                 (2, true, false) => (0xC42B1C, 0xFFFFFF),
                 (_, true, true) => (0x23282F, th::TEXT),
                 (_, true, false) => (0x1A1E25, th::TEXT),
-                _ => (th::BAR, idle),
+                _ => (th::BG, idle),
             };
             cv.fill(b, fill);
             let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
@@ -832,7 +985,6 @@ impl Ui {
                 0 => cv.fill(Rect::new(cx - s, cy, 2 * s, line), glyph),
                 1 if self.maximized => {
                     let k = self.p(2.0);
-                    // Back window: only its top and right edges show.
                     cv.fill(Rect::new(cx - s + k, cy - s, 2 * s - k, line), glyph);
                     cv.fill(Rect::new(cx + s - line, cy - s, line, 2 * s - k), glyph);
                     let front = Rect::new(cx - s, cy - s + k, 2 * s - k, 2 * s - k);
@@ -850,330 +1002,493 @@ impl Ui {
         }
     }
 
-    fn paint_library(&mut self, cv: &mut Canvas) {
-        let (reg, semi) = (self.f.regular, self.f.semi);
-        let x0 = self.p(28.0) as f32;
-        let base = (self.bar_h() + self.p(48.0)) as f32;
-        let end = self.te.draw(cv, semi, self.fs(22.0), x0, base, "Machines", th::TEXT, 400.0 * self.scale);
-        let running = self.vms.iter().filter(|v| matches!(v.state, RunState::Running { .. })).count();
-        let failed = self.vms.iter().filter(|v| matches!(v.state, RunState::Failed(_))).count();
-        let mut x = end + self.fs(16.0);
-        let mut chips: Vec<(String, u32)> = Vec::new();
-        if running > 0 {
-            chips.push((format!("{running} running"), th::RUNNING));
-        }
-        if failed > 0 {
-            chips.push((format!("{failed} failed"), th::FAILED));
-        }
-        chips.push((format!("{} total", self.vms.len()), th::OFF));
-        for (t, c) in chips {
-            x = self.chip(cv, x, base, &t, c) + self.fs(8.0);
-        }
-        // New machine.
-        let nr = self.new_rect();
-        let hover = self.hover == Some(Hit::New);
-        cv.fill_round(nr, self.fs(9.0), if hover { mix(th::ACCENT, 0xFFFFFF, 30) } else { th::ACCENT });
-        let (px, py) = (nr.x as f32 + self.fs(20.0), nr.y as f32 + nr.h as f32 / 2.0);
-        let a = self.fs(5.5);
-        cv.stroke(&[(px - a, py), (px + a, py)], self.fs(2.0), th::ACCENT_TEXT);
-        cv.stroke(&[(px, py - a), (px, py + a)], self.fs(2.0), th::ACCENT_TEXT);
-        let tb = (py + self.te.ascent(semi, self.fs(13.5)) * 0.36).round();
-        self.te.draw(cv, semi, self.fs(13.5), px + self.fs(14.0), tb, "New machine", th::ACCENT_TEXT, nr.w as f32);
-
-        let vis = self.visible();
-        if vis.is_empty() {
-            let msg = format!("No machine matches “{}”", self.query.trim());
-            self.te.draw(cv, reg, self.fs(14.0), x0, base + self.fs(64.0), &msg, th::MUTED, 900.0 * self.scale);
-            return;
-        }
-        let cards: Vec<(Rect, usize)> =
-            self.hits.iter().filter_map(|(r, h)| if let Hit::Card(i) = h { Some((*r, *i)) } else { None }).collect();
-        let clip = cv.clip();
-        for (r, i) in cards {
-            if !r.intersect(clip).is_empty() {
-                self.paint_card(cv, r, i);
-            }
-        }
-    }
-
-    fn chip(&mut self, cv: &mut Canvas, x: f32, base: f32, text: &str, dot: u32) -> f32 {
-        let reg = self.f.regular;
-        let s = self.fs(12.0);
-        let w = self.te.measure(reg, s, text);
-        let h = self.p(24.0);
-        let r = Rect::new(x as i32, (base - self.fs(16.5)) as i32, (w + self.fs(28.0)) as i32, h);
-        cv.fill_round(r, h as f32 / 2.0, th::CARD);
-        cv.fill_circle(r.x as f32 + self.fs(11.0), r.y as f32 + h as f32 / 2.0, self.fs(3.2), dot);
-        let b = (r.y as f32 + h as f32 / 2.0 + self.te.ascent(reg, s) * 0.36).round();
-        self.te.draw(cv, reg, s, r.x as f32 + self.fs(20.0), b, text, th::MUTED, w + 2.0);
-        r.right() as f32
-    }
-
     fn state_style(&self, s: &RunState) -> (String, u32) {
         match s {
             RunState::Off => ("Off".into(), th::OFF),
             RunState::Starting => ("Starting".into(), th::BUSY),
             RunState::Stopping => ("Shutting down".into(), th::BUSY),
-            RunState::Failed(_) => ("Failed".into(), th::FAILED),
+            RunState::Failed(_) => ("Didn't start".into(), th::FAILED),
             RunState::Running { since } => {
                 (format!("Running · {}", uptime(self.now.saturating_sub(*since))), th::RUNNING)
             }
         }
     }
 
-    fn specs(v: &VmView) -> String {
-        let mem = if v.memory_mib.is_multiple_of(1024) {
-            format!("{} GB", v.memory_mib / 1024)
-        } else {
-            format!("{} MB", v.memory_mib)
-        };
-        format!("{} · {} vCPU · {mem} · {}", v.os_label, v.cpus, v.gpu.label())
-    }
-
-    fn paint_card(&mut self, cv: &mut Canvas, r: Rect, i: usize) {
+    fn paint_stage(&mut self, cv: &mut Canvas) {
+        let Some(v) = self.selected_vm().cloned() else { return };
         let (reg, semi) = (self.f.regular, self.f.semi);
-        let hover = matches!(self.hover, Some(Hit::Card(j) | Hit::CardPrimary(j)) if j == i);
-        let selected = self.selected_index() == Some(i);
-        let v = self.vms[i].clone();
-        let bg = if hover { th::CARD_HOVER } else { th::CARD };
-        let border = if selected {
-            th::ACCENT
-        } else if hover {
-            th::BORDER_STRONG
-        } else {
-            th::BORDER
-        };
-        cv.round_border(r, self.fs(14.0), border, bg);
-        if selected {
-            cv.round_border(r.inset(1, 1), self.fs(13.0), th::ACCENT, bg);
+        let bz = self.bezel_rect();
+        let sc = self.screen_rect();
+        let running = matches!(v.state, RunState::Running { .. });
+        // Stage light: the screen's own colour spills onto the stage
+        // (local mode; remote mode keeps solid fills).
+        if !self.remote {
+            let tint = if running { self.glow } else { mix(self.glow, th::BG, 140) };
+            let steps = 16;
+            for k in (1..=steps).rev() {
+                let o = self.p(k as f32 * 5.0);
+                let a = ((steps - k + 1) * (steps - k + 1)) as u32 * 30 / (steps * steps) as u32;
+                let rr = Rect::new(bz.x - o, bz.y - o, bz.w + 2 * o, bz.h + 2 * o);
+                // Only the ring between this step and the next: no double blending.
+                let inner =
+                    Rect::new(rr.x + self.p(5.0), rr.y + self.p(5.0), rr.w - 2 * self.p(5.0), rr.h - 2 * self.p(5.0));
+                for band in ring_bands(rr, inner) {
+                    cv.fill_alpha(band, tint, a);
+                }
+            }
         }
-        let t = self.thumb_rect(r);
-        self.paint_screen(cv, t, &v, self.fs(9.0));
-        if hover && !matches!(v.state, RunState::Starting | RunState::Stopping) {
-            let b = self.card_button(r);
-            let on_button = self.hover == Some(Hit::CardPrimary(i));
-            if !self.remote {
-                cv.fill_alpha(t, 0x000000, 70);
-            }
-            let fill = if on_button { th::ACCENT } else { 0xF2F4F8 };
-            let icon = if on_button { th::ACCENT_TEXT } else { 0x10131A };
-            let (cx, cy, rad) = (b.x as f32 + b.w as f32 / 2.0, b.y as f32 + b.h as f32 / 2.0, b.w as f32 / 2.0);
-            cv.fill_circle(cx, cy, rad, fill);
-            if matches!(v.state, RunState::Running { .. }) {
-                // Shut down: a power glyph.
-                cv.ring(cx, cy + self.fs(1.0), self.fs(9.0), self.fs(2.4), icon);
-                cv.fill(
-                    Rect::new((cx - self.fs(3.5)) as i32, (cy - self.fs(13.0)) as i32, self.p(7.0), self.p(8.0)),
-                    fill,
-                );
-                cv.stroke(&[(cx, cy - self.fs(11.0)), (cx, cy - self.fs(2.0))], self.fs(2.4), icon);
-            } else {
-                let k = self.fs(10.0);
-                cv.fill_triangle((cx - k * 0.7, cy - k), (cx - k * 0.7, cy + k), (cx + k, cy), icon);
-            }
-            let label = if matches!(v.state, RunState::Running { .. }) { "Shut down" } else { "Start" };
-            let lw = self.te.measure(semi, self.fs(12.5), label);
-            let lb = b.bottom() as f32 + self.fs(22.0);
-            if !self.remote {
-                let pill = Rect::new(
-                    (cx - lw / 2.0 - self.fs(10.0)) as i32,
-                    (lb - self.fs(16.0)) as i32,
-                    (lw + self.fs(20.0)) as i32,
-                    self.p(23.0),
-                );
-                cv.fill_round(pill, self.fs(11.5), 0x0B0D11);
-            }
-            self.te.draw(cv, semi, self.fs(12.5), cx - lw / 2.0, lb, label, 0xF2F4F8, lw + 2.0);
-        }
-        // Name and state.
-        let nb = t.bottom() as f32 + self.fs(30.0);
+        let hover = self.hover == Some(Hit::Screen);
+        let bezel_edge = if hover { mix(th::BORDER_STRONG, self.glow, 120) } else { mix(th::BORDER, self.glow, 50) };
+        cv.round_border(bz, self.fs(16.0), bezel_edge, 0x07080B);
+        self.paint_screen(cv, sc, &v, hover);
+
+        // Name, state and system under the screen.
+        let y = self.info_y() as f32;
         let (label, color) = self.state_style(&v.state);
-        let pw = self.te.measure(semi, self.fs(12.0), &label) + self.fs(28.0);
-        let pill = Rect::new(
-            (r.right() as f32 - self.fs(14.0) - pw) as i32,
-            (nb - self.fs(16.5)) as i32,
-            pw as i32,
-            self.p(23.0),
-        );
-        cv.fill_round(pill, pill.h as f32 / 2.0, mix(th::CARD, color, 34));
-        cv.fill_circle(pill.x as f32 + self.fs(11.0), pill.y as f32 + pill.h as f32 / 2.0, self.fs(3.3), color);
-        self.te.draw(
-            cv,
-            semi,
-            self.fs(12.0),
-            pill.x as f32 + self.fs(19.0),
-            nb - self.fs(1.0),
-            &label,
-            mix(color, 0xFFFFFF, 90),
-            pw,
-        );
-        let name_w = pill.x as f32 - r.x as f32 - self.fs(30.0);
-        self.te.draw(cv, semi, self.fs(15.5), r.x as f32 + self.fs(14.0), nb, &v.name, th::TEXT, name_w);
-        let (line, col) = match &v.state {
-            RunState::Failed(msg) => (msg.clone(), mix(th::FAILED, th::TEXT, 60)),
-            _ => (Self::specs(&v), th::MUTED),
+        let (pr, sr, dr) = self.control_rects();
+        let name_w = (pr.x - bz.x) as f32 - self.fs(24.0);
+        self.te.draw(cv, semi, self.fs(24.0), bz.x as f32 + self.fs(4.0), y + self.fs(24.0), &v.name, th::TEXT, name_w);
+        let ly = y + self.fs(50.0);
+        let mut x = bz.x as f32 + self.fs(4.0);
+        cv.fill_circle(x + self.fs(4.0), ly - self.fs(4.5), self.fs(4.0), color);
+        x += self.fs(14.0);
+        x = self.te.draw(cv, semi, self.fs(13.0), x, ly, &label, mix(color, th::TEXT, 120), name_w);
+        let mem = gib(v.memory_mib);
+        let specs = format!("   {}  ·  {} vCPU  ·  {mem}  ·  {}", v.os_label, v.cpus, v.gpu.label());
+        self.te.draw(cv, reg, self.fs(13.0), x, ly, &specs, th::MUTED, (pr.x as f32 - x - self.fs(16.0)).max(0.0));
+
+        let busy = matches!(v.state, RunState::Starting | RunState::Stopping);
+        let (pl, sl) = if running || v.state == RunState::Stopping {
+            ("Shut down", "Force off")
+        } else {
+            ("Start", "Start in background")
         };
-        self.te.draw(
-            cv,
-            reg,
-            self.fs(12.5),
-            r.x as f32 + self.fs(14.0),
-            nb + self.fs(24.0),
-            &line,
-            col,
-            r.w as f32 - self.fs(28.0),
+        self.button(cv, pr, pl, true, self.hover == Some(Hit::Primary), busy);
+        self.button(cv, sr, sl, false, self.hover == Some(Hit::Secondary), v.state == RunState::Starting);
+        // Details toggle: three lines.
+        let dh = self.hover == Some(Hit::Details) || self.details_open;
+        cv.round_border(
+            dr,
+            self.fs(10.0),
+            if dh { th::BORDER_STRONG } else { th::BORDER },
+            if self.details_open { th::CARD_HOVER } else { th::CARD },
         );
+        let (cx, cy) = (dr.x as f32 + dr.w as f32 / 2.0, dr.y as f32 + dr.h as f32 / 2.0);
+        for d in [-5.0f32, 0.0, 5.0] {
+            let w = if d == 0.0 { 5.0 } else { 7.0 };
+            cv.stroke(
+                &[(cx - self.fs(7.0), cy + self.fs(d)), (cx + self.fs(w), cy + self.fs(d))],
+                self.fs(1.6),
+                th::TEXT,
+            );
+        }
     }
 
-    /// The guest screen: live, the last one seen (dimmed when off), or a
-    /// poster for machines that have never shown one.
-    fn paint_screen(&mut self, cv: &mut Canvas, t: Rect, v: &VmView, radius: f32) {
-        let semi = self.f.semi;
+    /// The guest screen: live, the last one seen, or a poster; with the big
+    /// action on hover (or always when off).
+    fn paint_screen(&mut self, cv: &mut Canvas, sc: Rect, v: &VmView, hover: bool) {
+        let (reg, semi) = (self.f.regular, self.f.semi);
+        let running = matches!(v.state, RunState::Running { .. });
+        let old = cv.set_clip(cv.clip().intersect(sc));
         match &v.thumb {
             Some(img) if img.w > 0 && img.h > 0 => {
-                cv.fill_round(t, radius, th::SCREEN);
-                // Fit inside, keep the aspect ratio.
-                let (sw, sh) = (t.w as f32 / img.w as f32, t.h as f32 / img.h as f32);
-                let k = sw.min(sh);
-                let (dw, dh) = ((img.w as f32 * k) as i32, (img.h as f32 * k) as i32);
-                let d = Rect::new(t.x + (t.w - dw) / 2, t.y + (t.h - dh) / 2, dw, dh);
-                let old = cv.set_clip(cv.clip().intersect(t.inset(1, 1)));
-                cv.draw_rgba_scaled(d, img.w, img.h, &img.rgba);
-                let off = !matches!(v.state, RunState::Running { .. });
-                if off && !self.remote {
-                    cv.fill_alpha(d, th::BG, 150);
-                }
-                cv.set_clip(old);
-                if off {
-                    let s = self.fs(11.5);
-                    let label = "Last screen";
-                    let w = self.te.measure(self.f.semi, s, label);
-                    let tag =
-                        Rect::new(t.x + self.p(10.0), t.y + self.p(10.0), (w + self.fs(18.0)) as i32, self.p(22.0));
-                    cv.fill_round(tag, self.fs(6.0), 0x0B0D11);
-                    let b = (tag.y as f32 + tag.h as f32 / 2.0 + self.te.ascent(self.f.semi, s) * 0.36).round();
-                    self.te.draw(cv, self.f.semi, s, tag.x as f32 + self.fs(9.0), b, label, th::MUTED, w + 2.0);
+                cv.fill(sc, th::SCREEN);
+                cv.draw_rgba_scaled(sc, img.w, img.h, &img.rgba);
+                if !running && !self.remote {
+                    cv.fill_alpha(sc, th::BG, 165);
                 }
             }
             _ => {
                 let tint = th::os_tint(&v.os_label);
-                cv.fill_round(t, radius, mix(th::SCREEN, tint, 26));
-                let (cx, cy) = (t.x as f32 + t.w as f32 / 2.0, t.y as f32 + t.h as f32 / 2.0 - self.fs(8.0));
-                let rad = (t.h as f32 * 0.2).min(self.fs(34.0));
-                cv.fill_circle(cx, cy, rad, mix(th::SCREEN, tint, 150));
-                let ini = initials(&v.os_label);
-                let s = rad * 0.78;
-                let w = self.te.measure(semi, s, &ini);
-                let b = (cy + self.te.ascent(semi, s) * 0.36).round();
-                self.te.draw(cv, semi, s, cx - w / 2.0, b, &ini, 0xFFFFFF, w + 2.0);
-                let hint = match v.state {
-                    RunState::Starting => "Starting…",
-                    RunState::Running { .. } => "Waiting for the first frame",
-                    RunState::Failed(_) => "Did not start",
-                    _ => "Not started yet",
-                };
-                let hs = self.fs(12.0);
-                let hw = self.te.measure(self.f.regular, hs, hint);
+                cv.fill(sc, mix(th::SCREEN, tint, 22));
+            }
+        }
+        cv.set_clip(old);
+        let (cx, cy) = (sc.x as f32 + sc.w as f32 / 2.0, sc.y as f32 + sc.h as f32 / 2.0);
+        match &v.state {
+            RunState::Running { .. } => {
+                if v.thumb.is_none() {
+                    self.centered(cv, reg, self.fs(14.0), cx, cy, "Waiting for the first frame…", th::MUTED);
+                }
+                // LIVE badge.
+                let s = self.fs(11.0);
+                let w = self.te.measure(semi, s, "LIVE");
+                let tag = Rect::new(sc.x + self.p(14.0), sc.y + self.p(14.0), (w + self.fs(26.0)) as i32, self.p(22.0));
+                cv.fill_round(tag, self.fs(6.0), 0x0B0D11);
+                cv.fill_circle(
+                    tag.x as f32 + self.fs(10.0),
+                    tag.y as f32 + tag.h as f32 / 2.0,
+                    self.fs(3.2),
+                    th::RUNNING,
+                );
+                let b = self.baseline(tag, semi, s);
+                self.te.draw(cv, semi, s, tag.x as f32 + self.fs(18.0), b, "LIVE", th::TEXT, w + 2.0);
+                if hover {
+                    self.big_action(cv, cx, cy, false, "Shut down");
+                }
+            }
+            RunState::Starting => {
+                self.centered(cv, semi, self.fs(18.0), cx, cy, "Starting…", th::TEXT);
+            }
+            RunState::Stopping => {
+                self.centered(cv, semi, self.fs(18.0), cx, cy, "Shutting down…", th::TEXT);
+            }
+            RunState::Failed(msg) => {
+                self.centered(cv, semi, self.fs(20.0), cx, cy - self.fs(36.0), "This machine didn't start", th::TEXT);
+                let s13 = self.fs(13.0);
+                let lines = wrap(&mut self.te, reg, s13, msg, sc.w as f32 * 0.7, 3);
+                for (n, l) in lines.iter().enumerate() {
+                    self.centered(
+                        cv,
+                        reg,
+                        self.fs(13.0),
+                        cx,
+                        cy - self.fs(8.0) + n as f32 * self.fs(19.0),
+                        l,
+                        mix(th::FAILED, th::TEXT, 90),
+                    );
+                }
+                self.big_action(cv, cx, cy + self.fs(72.0), hover, "Try again");
+            }
+            RunState::Off => {
+                if v.thumb.is_none() {
+                    let tint = th::os_tint(&v.os_label);
+                    let rad = self.fs(38.0);
+                    cv.fill_circle(cx, cy - self.fs(52.0), rad, mix(th::SCREEN, tint, 150));
+                    let ini = initials(&v.os_label);
+                    self.centered(cv, semi, self.fs(26.0), cx, cy - self.fs(52.0), &ini, 0xFFFFFF);
+                    self.centered(cv, reg, self.fs(13.0), cx, cy + self.fs(4.0), "Never started", th::MUTED);
+                    self.big_action(cv, cx, cy + self.fs(62.0), hover, "Start");
+                } else {
+                    self.big_action(cv, cx, cy, hover, "Start");
+                }
+            }
+        }
+    }
+
+    /// A round play/power button with a label under it.
+    fn big_action(&mut self, cv: &mut Canvas, cx: f32, cy: f32, hot: bool, label: &str) {
+        let r = self.fs(34.0);
+        let fill = if hot { th::ACCENT } else { 0xF1F3F8 };
+        let icon = if hot { th::ACCENT_TEXT } else { 0x0E1117 };
+        cv.fill_circle(cx, cy, r, fill);
+        if label == "Shut down" {
+            cv.ring(cx, cy + self.fs(1.5), self.fs(11.0), self.fs(2.8), icon);
+            cv.fill(
+                Rect::new((cx - self.fs(4.0)) as i32, (cy - self.fs(16.0)) as i32, self.p(8.0), self.p(10.0)),
+                fill,
+            );
+            cv.stroke(&[(cx, cy - self.fs(13.5)), (cx, cy - self.fs(2.0))], self.fs(2.8), icon);
+        } else {
+            let k = self.fs(13.0);
+            cv.fill_triangle((cx - k * 0.62, cy - k), (cx - k * 0.62, cy + k), (cx + k * 0.95, cy), icon);
+        }
+        let semi = self.f.semi;
+        let s = self.fs(13.0);
+        let w = self.te.measure(semi, s, label);
+        if !self.remote {
+            let pill = Rect::new(
+                (cx - w / 2.0 - self.fs(12.0)) as i32,
+                (cy + r + self.fs(12.0)) as i32,
+                (w + self.fs(24.0)) as i32,
+                self.p(26.0),
+            );
+            cv.fill_round(pill, self.fs(13.0), 0x0B0D11);
+        }
+        self.te.draw(cv, semi, s, cx - w / 2.0, cy + r + self.fs(30.0), label, th::TEXT, w + 2.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn centered(&mut self, cv: &mut Canvas, f: FontId, s: f32, cx: f32, cy: f32, text: &str, col: u32) {
+        let w = self.te.measure(f, s, text);
+        let b = (cy + self.te.ascent(f, s) * 0.36).round();
+        self.te.draw(cv, f, s, cx - w / 2.0, b, text, col, w + 2.0);
+    }
+
+    fn paint_dock(&mut self, cv: &mut Canvas) {
+        let dock = Rect::new(0, self.h - self.dock_h(), self.w, self.dock_h());
+        if cv.clip().intersect(dock).is_empty() {
+            return;
+        }
+        cv.fill(dock, th::BAR);
+        cv.fill(Rect::new(0, dock.y, self.w, 1), th::BORDER);
+        let (reg, semi) = (self.f.regular, self.f.semi);
+        let sel = self.selected_index();
+        for i in 0..self.vms.len() {
+            let t = self.dock_tile(i as i32);
+            if cv.clip().intersect(Rect::new(t.x, t.y, t.w, dock.bottom() - t.y)).is_empty() {
+                continue;
+            }
+            let v = self.vms[i].clone();
+            let selected = sel == Some(i);
+            let hover = self.hover == Some(Hit::Dock(i));
+            // Tile screen.
+            let old = cv.set_clip(cv.clip().intersect(t));
+            match &v.thumb {
+                Some(img) => {
+                    cv.fill(t, th::SCREEN);
+                    cv.draw_rgba_scaled(t, img.w, img.h, &img.rgba);
+                    if !matches!(v.state, RunState::Running { .. }) && !self.remote {
+                        cv.fill_alpha(t, th::BG, 150);
+                    }
+                }
+                None => {
+                    let tint = th::os_tint(&v.os_label);
+                    cv.fill(t, mix(th::SCREEN, tint, 30));
+                    let ini = initials(&v.os_label);
+                    let (cx, cy) = (t.x as f32 + t.w as f32 / 2.0, t.y as f32 + t.h as f32 / 2.0);
+                    cv.fill_circle(cx, cy, self.fs(18.0), mix(th::SCREEN, tint, 150));
+                    self.centered(cv, semi, self.fs(13.0), cx, cy, &ini, 0xFFFFFF);
+                }
+            }
+            cv.set_clip(old);
+            let edge = if selected {
+                th::ACCENT
+            } else if hover {
+                th::BORDER_STRONG
+            } else {
+                th::BORDER
+            };
+            cv.stroke_rect(t, edge);
+            if selected {
+                cv.stroke_rect(t.inset(1, 1), edge);
+            }
+            // State dot, ringed so it reads on any screen.
+            let (label, color) = self.state_style(&v.state);
+            let (dx, dy) = (t.right() as f32 - self.fs(11.0), t.y as f32 + self.fs(11.0));
+            cv.fill_circle(dx, dy, self.fs(6.0), 0x0B0D11);
+            cv.fill_circle(dx, dy, self.fs(4.0), color);
+            let _ = label;
+            let nb = t.bottom() as f32 + self.fs(20.0);
+            let col = if selected { th::TEXT } else { th::MUTED };
+            let f = if selected { semi } else { reg };
+            self.te.draw(cv, f, self.fs(12.5), t.x as f32 + self.fs(2.0), nb, &v.name, col, t.w as f32 - self.fs(4.0));
+        }
+        // New.
+        let t = self.dock_tile(self.vms.len() as i32);
+        let hover = self.hover == Some(Hit::DockNew);
+        dashed_rect(cv, t, if hover { th::ACCENT } else { th::BORDER_STRONG }, self.scale);
+        let (cx, cy) = (t.x as f32 + t.w as f32 / 2.0, t.y as f32 + t.h as f32 / 2.0);
+        let a = self.fs(9.0);
+        let col = if hover { th::ACCENT } else { th::MUTED };
+        cv.stroke(&[(cx - a, cy), (cx + a, cy)], self.fs(2.0), col);
+        cv.stroke(&[(cx, cy - a), (cx, cy + a)], self.fs(2.0), col);
+        self.te.draw(
+            cv,
+            reg,
+            self.fs(12.5),
+            t.x as f32 + self.fs(2.0),
+            t.bottom() as f32 + self.fs(20.0),
+            "New machine",
+            th::MUTED,
+            t.w as f32,
+        );
+    }
+
+    fn paint_drawer(&mut self, cv: &mut Canvas) {
+        let Some(v) = self.selected_vm().cloned() else { return };
+        let (reg, semi, mono) = (self.f.regular, self.f.semi, self.f.mono);
+        let dw = self.drawer_w();
+        let r = Rect::new(self.w - dw, self.bar_h(), dw, self.h - self.bar_h() - self.dock_h());
+        cv.fill(r, th::PANEL);
+        cv.fill(Rect::new(r.x, r.y, 1, r.h), th::BORDER);
+        let x = r.x as f32 + self.fs(24.0);
+        let w = r.w as f32 - self.fs(48.0);
+        let mut y = r.y as f32 + self.fs(38.0);
+        self.te.draw(cv, semi, self.fs(12.0), x, y, "HARDWARE", th::FAINT, w);
+        y += self.fs(8.0);
+        let rows: Vec<(&str, String)> = vec![
+            ("System", v.os_label.clone()),
+            ("Processors", format!("{} virtual CPUs", v.cpus)),
+            ("Memory", gib(v.memory_mib)),
+            ("Disk", format!("{} GB · {}", v.disk_gib, if v.nvme { "NVMe" } else { "virtio" })),
+            ("Graphics", v.gpu.label().to_string()),
+            ("Firmware", if v.uefi { "UEFI".into() } else { "BIOS".into() }),
+            ("Network", if v.forwards == 0 { "NAT".into() } else { format!("NAT · {} forwarded", v.forwards) }),
+        ];
+        for (k, val) in rows {
+            y += self.fs(30.0);
+            cv.fill(Rect::new(x as i32, (y - self.fs(20.0)) as i32, w as i32, 1), th::BORDER);
+            self.te.draw(cv, reg, self.fs(13.0), x, y, k, th::MUTED, self.fs(110.0));
+            self.te.draw(cv, reg, self.fs(13.0), x + self.fs(110.0), y, &val, th::TEXT, w - self.fs(110.0));
+        }
+        y += self.fs(44.0);
+        self.te.draw(cv, semi, self.fs(12.0), x, y, "QEMU COMMAND", th::FAINT, w);
+        let hint = format!("qorral info {}", v.id);
+        let hw = self.te.measure(mono, self.fs(11.5), &hint);
+        self.te.draw(cv, mono, self.fs(11.5), x + w - hw, y, &hint, th::ACCENT, hw + 2.0);
+        y += self.fs(10.0);
+        let s = self.fs(11.5);
+        let cw = self.te.measure(mono, s, "m").max(1.0);
+        let per = ((w - self.fs(24.0)) / cw).floor().max(10.0) as usize;
+        let chars: Vec<char> = v.command.chars().collect();
+        let max_h = (r.bottom() as f32 - y - self.fs(24.0)).max(0.0);
+        let need = chars.len().div_ceil(per) as f32 * self.fs(17.0) + self.fs(22.0);
+        let box_h = need.min(max_h);
+        if box_h > self.fs(40.0) {
+            let bx = Rect::new(x as i32, y as i32, w as i32, box_h as i32);
+            cv.round_border(bx, self.fs(8.0), th::BORDER, th::BG);
+            let lines = ((box_h - self.fs(8.0)) / self.fs(17.0)) as usize;
+            let mut ly = y + self.fs(22.0);
+            for (n, chunk) in chars.chunks(per).take(lines).enumerate() {
+                let line: String = chunk.iter().collect();
+                self.te.draw(cv, mono, s, x + self.fs(12.0), ly, &line, if n == 0 { th::TEXT } else { th::MUTED }, w);
+                ly += self.fs(17.0);
+            }
+        }
+    }
+
+    fn paint_results(&mut self, cv: &mut Canvas) {
+        let panel = self.results_panel();
+        if cv.clip().intersect(panel.inset(-self.p(12.0), -self.p(12.0))).is_empty() {
+            return;
+        }
+        let (reg, semi) = (self.f.regular, self.f.semi);
+        if !self.remote {
+            for k in 1..=6 {
+                let o = self.p(k as f32 * 2.0);
+                let sh = Rect::new(panel.x - o, panel.y - o + self.p(6.0), panel.w + 2 * o, panel.h + 2 * o);
+                for band in ring_bands(
+                    sh,
+                    Rect::new(sh.x + self.p(2.0), sh.y + self.p(2.0), sh.w - self.p(4.0), sh.h - self.p(4.0)),
+                ) {
+                    cv.fill_alpha(band, 0x000000, (7 - k) as u32 * 14);
+                }
+            }
+        }
+        cv.round_border(panel, self.fs(14.0), th::BORDER_STRONG, th::PANEL);
+        let results = self.results.clone();
+        for (i, res) in results.iter().enumerate() {
+            let r = self.result_rect(i);
+            let sel = i == self.result_sel;
+            if sel {
+                cv.fill_round(r.inset(self.p(6.0), self.p(2.0)), self.fs(10.0), th::CARD_HOVER);
+                cv.fill_round(
+                    Rect::new(r.x + self.p(6.0), r.y + self.p(14.0), self.p(3.0), r.h - self.p(28.0)),
+                    self.fs(1.5),
+                    th::ACCENT,
+                );
+            }
+            let icon = Rect::new(r.x + self.p(18.0), r.y + (r.h - self.p(36.0)) / 2, self.p(56.0), self.p(36.0));
+            let tx = icon.right() as f32 + self.fs(14.0);
+            let (title, sub, tint, ini, thumb) = match res {
+                Intent::Create(d) => {
+                    let (name, cpus, mem, disk, gpu) = d.resolved();
+                    let sys = d.preset.and_then(crate::model::preset).map_or("Any system", |p| p.label);
+                    (
+                        format!("Create “{name}”"),
+                        format!("{sys}  ·  {mem} GB memory  ·  {cpus} CPUs  ·  {disk} GB disk  ·  {}", gpu.label()),
+                        th::os_tint(sys),
+                        if d.preset.is_some() { initials(sys) } else { "+".into() },
+                        None,
+                    )
+                }
+                Intent::Machine(verb, m) => {
+                    let v = &self.vms[*m];
+                    let word = match verb {
+                        Verb::Open => "Open",
+                        Verb::Start => "Start",
+                        Verb::Stop => "Shut down",
+                        Verb::ForceOff => "Force off",
+                    };
+                    let (st, _) = self.state_style(&v.state);
+                    (
+                        format!("{word} “{}”", v.name),
+                        format!("{st}  ·  {}", v.os_label),
+                        th::os_tint(&v.os_label),
+                        initials(&v.os_label),
+                        v.thumb.clone(),
+                    )
+                }
+            };
+            match thumb {
+                Some(t) => {
+                    cv.fill(icon, th::SCREEN);
+                    cv.draw_rgba_scaled(icon, t.w, t.h, &t.rgba);
+                    cv.stroke_rect(icon, th::BORDER);
+                }
+                None => {
+                    cv.fill_round(icon, self.fs(8.0), mix(th::PANEL, tint, 120));
+                    let (cx, cy) = (icon.x as f32 + icon.w as f32 / 2.0, icon.y as f32 + icon.h as f32 / 2.0);
+                    self.centered(cv, semi, self.fs(15.0), cx, cy, &ini, 0xFFFFFF);
+                }
+            }
+            let hint_w = if sel { self.fs(130.0) } else { 0.0 };
+            let avail = r.right() as f32 - tx - self.fs(18.0) - hint_w;
+            self.te.draw(cv, semi, self.fs(14.5), tx, r.y as f32 + self.fs(26.0), &title, th::TEXT, avail);
+            self.te.draw(cv, reg, self.fs(12.5), tx, r.y as f32 + self.fs(45.0), &sub, th::MUTED, avail);
+            if sel {
+                let hint = if matches!(res, Intent::Create(_)) { "Choose image  ⏎" } else { "⏎" };
+                let s = self.fs(12.0);
+                let hw = self.te.measure(reg, s, hint);
                 self.te.draw(
                     cv,
-                    self.f.regular,
-                    hs,
-                    cx - hw / 2.0,
-                    cy + rad + self.fs(24.0),
+                    reg,
+                    s,
+                    r.right() as f32 - self.fs(20.0) - hw,
+                    r.y as f32 + r.h as f32 / 2.0 + self.fs(4.0),
                     hint,
-                    mix(th::MUTED, tint, 60),
+                    th::ACCENT,
                     hw + 2.0,
                 );
             }
         }
     }
 
-    fn paint_pane(&mut self, cv: &mut Canvas) {
-        let Some(i) = self.selected_index() else { return };
-        let v = self.vms[i].clone();
-        let (reg, semi, mono) = (self.f.regular, self.f.semi, self.f.mono);
-        let pw = self.pane_w();
-        let pane = Rect::new(self.w - pw, self.bar_h(), pw, self.h - self.bar_h());
-        cv.fill(pane, th::PANEL);
-        cv.fill(Rect::new(pane.x, pane.y, 1, pane.h), th::BORDER);
-        let pv = self.preview_rect();
-        self.paint_screen(cv, pv, &v, self.fs(10.0));
-        let x = pv.x as f32;
-        let mut y = pv.bottom() as f32 + self.fs(38.0);
-        self.te.draw(cv, semi, self.fs(20.0), x, y, &v.name, th::TEXT, pv.w as f32);
-        y += self.fs(26.0);
-        let (label, color) = self.state_style(&v.state);
-        cv.fill_circle(x + self.fs(4.0), y - self.fs(4.5), self.fs(3.6), color);
-        self.te.draw(cv, reg, self.fs(13.0), x + self.fs(14.0), y, &label, th::MUTED, pv.w as f32);
-        if let RunState::Failed(msg) = &v.state {
-            y += self.fs(20.0);
-            self.te.draw(cv, reg, self.fs(12.0), x, y, msg, th::FAILED, pv.w as f32);
-        }
-        // Actions.
-        let (a, b) = self.pane_buttons();
-        let running = matches!(v.state, RunState::Running { .. } | RunState::Stopping);
-        let busy = matches!(v.state, RunState::Starting | RunState::Stopping);
-        let (pl, sl) = if running { ("Shut down", "Force off") } else { ("Start", "Start in background") };
-        self.button(cv, a, pl, true, self.hover == Some(Hit::Primary), busy);
-        self.button(cv, b, sl, false, self.hover == Some(Hit::Secondary), v.state == RunState::Starting);
-
-        // Hardware.
-        y = a.bottom() as f32 + self.fs(40.0);
-        self.te.draw(cv, semi, self.fs(12.0), x, y, "HARDWARE", th::FAINT, pv.w as f32);
-        y += self.fs(10.0);
-        let mem = if v.memory_mib.is_multiple_of(1024) {
-            format!("{} GB", v.memory_mib / 1024)
-        } else {
-            format!("{} MB", v.memory_mib)
-        };
-        let rows: Vec<(&str, String)> = vec![
-            ("System", v.os_label.clone()),
-            ("Processors", format!("{} virtual CPUs", v.cpus)),
-            ("Memory", mem),
-            ("Disk", format!("{} GB · {}", v.disk_gib, if v.nvme { "NVMe" } else { "virtio" })),
-            ("Graphics", v.gpu.label().to_string()),
-            ("Firmware", if v.uefi { "UEFI".into() } else { "BIOS".into() }),
-            (
-                "Network",
-                if v.forwards == 0 {
-                    "NAT".into()
-                } else {
-                    format!("NAT · {} port forward{}", v.forwards, if v.forwards == 1 { "" } else { "s" })
-                },
-            ),
-        ];
-        for (k, val) in rows {
-            y += self.fs(28.0);
-            cv.fill(Rect::new(pv.x, (y - self.fs(19.0)) as i32, pv.w, 1), th::BORDER);
-            self.te.draw(cv, reg, self.fs(13.0), x, y, k, th::MUTED, self.fs(110.0));
-            self.te.draw(cv, reg, self.fs(13.0), x + self.fs(110.0), y, &val, th::TEXT, pv.w as f32 - self.fs(110.0));
-        }
-        // Command line (power users): the exact QEMU invocation, wrapped.
-        y += self.fs(40.0);
-        self.te.draw(cv, semi, self.fs(12.0), x, y, "QEMU COMMAND", th::FAINT, pv.w as f32);
-        let hint = format!("qorral info {}", v.id);
-        let hw = self.te.measure(mono, self.fs(11.5), &hint);
-        self.te.draw(cv, mono, self.fs(11.5), pv.right() as f32 - hw, y, &hint, th::ACCENT, hw + 2.0);
-        y += self.fs(10.0);
-        let max_h = (pane.bottom() as f32 - y - self.fs(24.0)).max(0.0);
-        let s = self.fs(11.5);
-        let cw = self.te.measure(mono, s, "m").max(1.0);
-        let per_line = ((pv.w as f32 - self.fs(24.0)) / cw).floor().max(10.0) as usize;
-        let chars: Vec<char> = v.command.chars().collect();
-        let need = chars.len().div_ceil(per_line) as f32 * self.fs(17.0) + self.fs(22.0);
-        let box_h = need.min(max_h);
-        if box_h > self.fs(40.0) {
-            let bx = Rect::new(pv.x, y as i32, pv.w, box_h as i32);
-            cv.round_border(bx, self.fs(8.0), th::BORDER, th::BG);
-            let lines = ((box_h - self.fs(8.0)) / self.fs(17.0)) as usize + 1;
-            let mut ly = y + self.fs(22.0);
-            for (n, chunk) in chars.chunks(per_line).take(lines.saturating_sub(1)).enumerate() {
-                let line: String = chunk.iter().collect();
-                let col = if n == 0 { th::TEXT } else { th::MUTED };
-                self.te.draw(cv, mono, s, x + self.fs(12.0), ly, &line, col, bx.w as f32);
-                ly += self.fs(17.0);
+    fn paint_welcome(&mut self, cv: &mut Canvas) {
+        let (reg, semi) = (self.f.regular, self.f.semi);
+        let b = self.bar_rect();
+        let cx = self.w as f32 / 2.0;
+        if !self.remote {
+            // A wide, low light behind the prompt.
+            let steps = 14;
+            for k in (1..=steps).rev() {
+                let o = self.p(k as f32 * 9.0);
+                let rr = Rect::new(b.x - o * 2, b.y - o, b.w + 4 * o, b.h + 2 * o);
+                let inner =
+                    Rect::new(rr.x + self.p(18.0), rr.y + self.p(9.0), rr.w - self.p(36.0), rr.h - self.p(18.0));
+                let a = ((steps - k + 1) * (steps - k + 1)) as u32 * 22 / (steps * steps) as u32;
+                for band in ring_bands(rr, inner) {
+                    cv.fill_alpha(band, th::ACCENT, a);
+                }
             }
         }
+        self.centered(cv, semi, self.fs(34.0), cx, b.y as f32 - self.fs(70.0), "What do you want to run?", th::TEXT);
+        self.centered(
+            cv,
+            reg,
+            self.fs(14.5),
+            cx,
+            b.y as f32 - self.fs(34.0),
+            "Type it the way you'd say it. Qorral sets up the machine.",
+            th::MUTED,
+        );
+        if self.results_open() {
+            return;
+        }
+        for (i, r) in self.suggest_rects().into_iter().enumerate() {
+            let hover = self.hover == Some(Hit::Suggest(i));
+            let (name, tint) = match TILES.get(i) {
+                Some(t) => (t.1.to_string(), th::os_tint(t.1)),
+                None => ("Any ISO file…".to_string(), th::ACCENT),
+            };
+            cv.round_border(
+                r,
+                r.h as f32 / 2.0,
+                if hover { mix(th::BORDER_STRONG, tint, 120) } else { th::BORDER },
+                if hover { th::CARD_HOVER } else { th::CARD },
+            );
+            let (dx, dy) = (r.x as f32 + self.fs(20.0), r.y as f32 + r.h as f32 / 2.0);
+            cv.fill_circle(dx, dy, self.fs(11.0), mix(th::CARD, tint, 190));
+            let ini = if i < TILES.len() { initials(&name).chars().take(1).collect() } else { "+".to_string() };
+            self.centered(cv, semi, self.fs(11.0), dx, dy, &ini, 0xFFFFFF);
+            let s = self.fs(13.0);
+            let bl = self.baseline(r, semi, s);
+            self.te.draw(cv, semi, s, dx + self.fs(18.0), bl, &name, th::TEXT, r.w as f32);
+        }
+        let foot = "From a terminal:  qorral create my-vm --iso image.iso";
+        let fy = self.suggest_rects().first().map_or(b.bottom(), |r| r.bottom()) as f32 + self.fs(56.0);
+        self.centered(cv, self.f.mono, self.fs(12.0), cx, fy, foot, th::FAINT);
     }
 
     fn button(&mut self, cv: &mut Canvas, r: Rect, label: &str, primary: bool, hover: bool, busy: bool) {
@@ -1184,134 +1499,68 @@ impl Ui {
             (false, _) => (if hover { th::CARD_HOVER } else { th::CARD }, th::TEXT),
         };
         if primary || busy {
-            cv.fill_round(r, self.fs(9.0), bg);
+            cv.fill_round(r, self.fs(10.0), bg);
         } else {
-            cv.round_border(r, self.fs(9.0), if hover { th::BORDER_STRONG } else { th::BORDER }, bg);
+            cv.round_border(r, self.fs(10.0), if hover { th::BORDER_STRONG } else { th::BORDER }, bg);
         }
-        let s = self.fs(13.0);
+        let s = self.fs(13.5);
         let w = self.te.measure(semi, s, label);
-        let b = (r.y as f32 + r.h as f32 / 2.0 + self.te.ascent(semi, s) * 0.36).round();
+        let b = self.baseline(r, semi, s);
         self.te.draw(cv, semi, s, r.x as f32 + (r.w as f32 - w) / 2.0, b, label, fg, r.w as f32);
-    }
-
-    fn paint_empty(&mut self, cv: &mut Canvas) {
-        let (reg, semi) = (self.f.regular, self.f.semi);
-        let tiles = self.tile_rects();
-        let Some(first) = tiles.first().copied() else { return };
-        let cx = self.w as f32 / 2.0;
-        let title = "Create your first machine";
-        let tw = self.te.measure(semi, self.fs(28.0), title);
-        let ty = first.y as f32 - self.fs(78.0);
-        self.te.draw(cv, semi, self.fs(28.0), cx - tw / 2.0, ty, title, th::TEXT, tw + 2.0);
-        let sub = "Pick a system and point Qorral at its install image. It sets up the rest.";
-        let sw = self.te.measure(reg, self.fs(14.5), sub);
-        self.te.draw(cv, reg, self.fs(14.5), cx - sw / 2.0, ty + self.fs(32.0), sub, th::MUTED, sw + 2.0);
-        for (i, r) in tiles.into_iter().enumerate() {
-            let hover = self.hover == Some(Hit::Tile(i));
-            if let Some((_, name, line)) = TILES.get(i) {
-                let tint = th::os_tint(name);
-                cv.round_border(
-                    r,
-                    self.fs(14.0),
-                    if hover { th::BORDER_STRONG } else { th::BORDER },
-                    if hover { th::CARD_HOVER } else { th::CARD },
-                );
-                let (ccx, ccy) = (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + self.fs(52.0));
-                cv.fill_circle(ccx, ccy, self.fs(24.0), mix(th::CARD, tint, if hover { 210 } else { 170 }));
-                let ini = initials(name);
-                let iw = self.te.measure(semi, self.fs(17.0), &ini);
-                let ib = (ccy + self.te.ascent(semi, self.fs(17.0)) * 0.36).round();
-                self.te.draw(cv, semi, self.fs(17.0), ccx - iw / 2.0, ib, &ini, 0xFFFFFF, iw + 2.0);
-                let nw = self.te.measure(semi, self.fs(14.5), name);
-                self.te.draw(
-                    cv,
-                    semi,
-                    self.fs(14.5),
-                    ccx - nw / 2.0,
-                    r.y as f32 + self.fs(108.0),
-                    name,
-                    th::TEXT,
-                    nw + 2.0,
-                );
-                let lw = self.te.measure(reg, self.fs(12.0), line);
-                self.te.draw(
-                    cv,
-                    reg,
-                    self.fs(12.0),
-                    ccx - lw / 2.0,
-                    r.y as f32 + self.fs(128.0),
-                    line,
-                    th::MUTED,
-                    lw + 2.0,
-                );
-            } else {
-                // "Any image": a dashed outline in solid steps (no alpha, RDP-friendly).
-                cv.fill_round(r, self.fs(14.0), if hover { th::CARD } else { th::BG });
-                dashed_round(cv, r, if hover { th::ACCENT } else { th::BORDER_STRONG }, self.scale);
-                let (ccx, ccy) = (r.x as f32 + r.w as f32 / 2.0, r.y as f32 + self.fs(52.0));
-                let a = self.fs(9.0);
-                let col = if hover { th::ACCENT } else { th::MUTED };
-                cv.stroke(&[(ccx - a, ccy), (ccx + a, ccy)], self.fs(2.2), col);
-                cv.stroke(&[(ccx, ccy - a), (ccx, ccy + a)], self.fs(2.2), col);
-                let n = "Any other system";
-                let nw = self.te.measure(semi, self.fs(14.5), n);
-                self.te.draw(
-                    cv,
-                    semi,
-                    self.fs(14.5),
-                    ccx - nw / 2.0,
-                    r.y as f32 + self.fs(108.0),
-                    n,
-                    th::TEXT,
-                    nw + 2.0,
-                );
-                let l = "Choose an ISO file";
-                let lw = self.te.measure(reg, self.fs(12.0), l);
-                self.te.draw(
-                    cv,
-                    reg,
-                    self.fs(12.0),
-                    ccx - lw / 2.0,
-                    r.y as f32 + self.fs(128.0),
-                    l,
-                    th::MUTED,
-                    lw + 2.0,
-                );
-            }
-        }
-        let foot = "Or from a terminal:  qorral create my-vm --iso path/to/image.iso";
-        let fw = self.te.measure(self.f.mono, self.fs(12.0), foot);
-        let last = self.tile_rects().last().copied().unwrap_or(first);
-        self.te.draw(
-            cv,
-            self.f.mono,
-            self.fs(12.0),
-            cx - fw / 2.0,
-            last.bottom() as f32 + self.fs(48.0),
-            foot,
-            th::FAINT,
-            fw + 2.0,
-        );
     }
 }
 
-fn dashed_round(cv: &mut Canvas, r: Rect, color: u32, scale: f32) {
+/// The four bands of `outer` that lie outside `inner`.
+fn ring_bands(outer: Rect, inner: Rect) -> [Rect; 4] {
+    [
+        Rect::new(outer.x, outer.y, outer.w, inner.y - outer.y),
+        Rect::new(outer.x, inner.bottom(), outer.w, outer.bottom() - inner.bottom()),
+        Rect::new(outer.x, inner.y, inner.x - outer.x, inner.h),
+        Rect::new(inner.right(), inner.y, outer.right() - inner.right(), inner.h),
+    ]
+}
+
+fn dashed_rect(cv: &mut Canvas, r: Rect, color: u32, scale: f32) {
     let (dash, gap) = ((6.0 * scale) as i32, (5.0 * scale) as i32);
-    let inset = (10.0 * scale) as i32;
-    let mut x = r.x + inset;
-    while x < r.right() - inset {
-        let w = dash.min(r.right() - inset - x);
+    let mut x = r.x;
+    while x < r.right() {
+        let w = dash.min(r.right() - x);
         cv.fill(Rect::new(x, r.y, w, 1), color);
         cv.fill(Rect::new(x, r.bottom() - 1, w, 1), color);
         x += dash + gap;
     }
-    let mut y = r.y + inset;
-    while y < r.bottom() - inset {
-        let h = dash.min(r.bottom() - inset - y);
+    let mut y = r.y;
+    while y < r.bottom() {
+        let h = dash.min(r.bottom() - y);
         cv.fill(Rect::new(r.x, y, 1, h), color);
         cv.fill(Rect::new(r.right() - 1, y, 1, h), color);
         y += dash + gap;
     }
+}
+
+/// Greedy word wrap into at most `max` lines (the last one ellipsised by draw).
+fn wrap(te: &mut TextEngine, f: FontId, s: f32, text: &str, width: f32, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let cand = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+        if te.measure(f, s, &cand) > width && !cur.is_empty() {
+            lines.push(std::mem::replace(&mut cur, word.to_string()));
+            if lines.len() == max {
+                return lines;
+            }
+        } else {
+            cur = cand;
+        }
+    }
+    if !cur.is_empty() && lines.len() < max {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn gib(mib: u32) -> String {
+    if mib.is_multiple_of(1024) { format!("{} GB", mib / 1024) } else { format!("{mib} MB") }
 }
 
 /// Merges damage: overlapping rectangles join, and many small ones become
@@ -1382,6 +1631,14 @@ mod tests {
         let many: Vec<Rect> = (0..40).map(|i| Rect::new(i * 20, 0, 10, 10)).collect();
         assert_eq!(coalesce(many, b).len(), 1);
         assert!(coalesce(vec![Rect::new(-50, -50, 10, 10)], b).is_empty(), "off-screen damage is dropped");
+    }
+
+    #[test]
+    fn ring_bands_cover_exactly_the_ring() {
+        let outer = Rect::new(0, 0, 10, 10);
+        let inner = Rect::new(2, 2, 6, 6);
+        let area: u64 = ring_bands(outer, inner).iter().map(|r| r.area()).sum();
+        assert_eq!(area, outer.area() - inner.area());
     }
 
     #[test]

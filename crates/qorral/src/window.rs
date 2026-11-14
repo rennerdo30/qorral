@@ -273,7 +273,8 @@ impl App {
                     send(&p, UserEvent::Views(model::views(&lib, qemu.lock().ok().and_then(|g| g.clone()).as_ref())));
                 });
             }
-            Action::NewFromIso { preset } => {
+            Action::Create(draft) => {
+                let preset = draft.preset;
                 std::thread::spawn(move || {
                     let title = match preset.and_then(model::preset) {
                         Some(p) => format!("Choose the {} install image", p.label),
@@ -287,8 +288,21 @@ impl App {
                         toast(&p, "QEMU not found: set QORRAL_QEMU to the folder with qemu-system-x86_64".into());
                         return;
                     };
-                    let name = model::default_name(preset, Some(&iso));
-                    let cfg: VmConfig = model::config_for(&name, preset, Some(&iso));
+                    let name = draft.name.clone().unwrap_or_else(|| model::default_name(preset, Some(&iso)));
+                    let mut cfg: VmConfig = model::config_for(&name, preset, Some(&iso));
+                    // The words in the intent bar win over the preset.
+                    if let Some(n) = draft.cpus {
+                        cfg.cpus = n;
+                    }
+                    if let Some(n) = draft.memory_gib {
+                        cfg.memory_mib = n * 1024;
+                    }
+                    if let Some(n) = draft.disk_gib {
+                        cfg.disk_gib = n;
+                    }
+                    if let Some(g) = draft.gpu {
+                        cfg.gpu = g;
+                    }
                     match supervisor::create(&lib, &q, &cfg) {
                         Ok(e) => {
                             send(&p, UserEvent::Views(model::views(&lib, Some(&q))));
@@ -317,11 +331,7 @@ impl App {
             }
             UserEvent::Thumb(id, t) => ui.set_thumb(&id, t),
             UserEvent::Toast(t) => ui.set_toast(t),
-            UserEvent::Select(id) => {
-                ui.selected = Some(id);
-                let vms = ui.vms.clone();
-                ui.set_vms(vms);
-            }
+            UserEvent::Select(id) => ui.select_id(&id),
             UserEvent::Activate => {
                 if let Some(g) = &self.gfx {
                     g.window.set_minimized(false);

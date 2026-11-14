@@ -4,6 +4,7 @@
 pub mod cli;
 #[cfg(windows)]
 pub mod frame;
+pub mod intent;
 pub mod model;
 pub mod platform;
 pub mod single;
@@ -52,6 +53,8 @@ pub struct GuiArgs {
     pub hover: Option<(i32, i32)>,
     pub query: Option<String>,
     pub select: Option<String>,
+    /// Snapshot with the details drawer open.
+    pub details: bool,
 }
 
 pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, String> {
@@ -73,6 +76,7 @@ pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, Str
             "--remote" => a.remote = true,
             "--query" => a.query = Some(val("--query")?),
             "--select" => a.select = Some(val("--select")?),
+            "--details" => a.details = true,
             "--hover" => {
                 let v = val("--hover")?;
                 let (x, y) = v.split_once(',').ok_or("--hover is X,Y")?;
@@ -84,7 +88,7 @@ pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, Str
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: qorral-gui [--snapshot out.png [--size WxH] [--scale S] [--demo|--empty] [--remote] [--hover X,Y] [--query Q] [--select ID]] [--smoke]"
+                    "usage: qorral-gui [--snapshot out.png [--size WxH] [--scale S] [--demo|--empty] [--remote] [--hover X,Y] [--query Q] [--select ID] [--details]] [--smoke]"
                 );
                 std::process::exit(0);
             }
