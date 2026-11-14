@@ -86,7 +86,19 @@ pub fn start(
     if state(entry) == State::Running {
         return Err(format!("{} is already running", entry.config.name));
     }
-    let ports = pick_ports(lib).ok_or("no free local ports for QMP")?;
+    // Ports can be briefly taken: by a VM that just stopped, or by WSL, which
+    // reserves local ports while a distro runs and for about a minute after.
+    // Qorral's range avoids WSL's usual 44400–44601, and still waits (bounded).
+    let wait_end = Instant::now() + Duration::from_secs(180);
+    let ports = loop {
+        if let Some(p) = pick_ports(lib) {
+            break p;
+        }
+        if Instant::now() >= wait_end {
+            return Err("no free local ports for QMP after waiting 3 minutes".into());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
     let paths = VmPaths::in_dir(&entry.dir);
     let fw = q.firmware_code();
     if entry.config.firmware == Firmware::Uefi && fw.is_none() {

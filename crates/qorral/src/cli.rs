@@ -23,7 +23,7 @@ usage: qorral [command] [options]      (no command: open the app)
   list                                  every machine and its state
   info <vm>                             settings, state and the QEMU command line
   create <name> [--iso FILE] [--preset ID] [--cpus N] [--memory GB] [--disk GB]
-                [--gpu basic|opengl|vulkan]
+                [--gpu basic|opengl|vulkan|venus]
   start <vm> [--window] [--minutes N]   start (headless unless --window); N = time limit
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
@@ -284,8 +284,8 @@ fn create(lib: &Library, o: &Opts) -> Result<(), Fail> {
         c.gpu = match g {
             "basic" => GpuMode::Basic,
             "opengl" | "gl" => GpuMode::Opengl,
-            "vulkan" => GpuMode::Vulkan,
-            _ => return Err(Fail::Usage("--gpu is basic, opengl or vulkan".into())),
+            "vulkan" | "venus" => GpuMode::Vulkan,
+            _ => return Err(Fail::Usage("--gpu is basic, opengl (gl) or vulkan (venus)".into())),
         };
     }
     let q = qemu()?;
