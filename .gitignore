@@ -1,0 +1,6 @@
+/target
+*.qcow2
+*.img
+*.iso
+*.fd
+/vms/
