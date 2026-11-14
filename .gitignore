@@ -1,6 +1,10 @@
-/target
+/target/
+# Machine-local Cargo config (template: .cargo/config.example.toml)
+/.cargo/config.toml
+/artifacts/
+*.log
+# VM images never belong in the repository.
 *.qcow2
 *.img
 *.iso
 *.fd
-/vms/

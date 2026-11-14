@@ -1,3 +1,3 @@
-# Hangar
+@AGENTS.md
 
-Read `AGENTS.md` (it points at the shared rules in `E:/Development`).
+The rules above (`AGENTS.md`) bind every Claude session and every job you start in this repository, above all the **UX rule** and the **performance rules**. Read the two shared rule files that `AGENTS.md` names before any work.

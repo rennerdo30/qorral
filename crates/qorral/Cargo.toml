@@ -1,0 +1,42 @@
+[package]
+name = "qorral"
+description = "Qorral: a fast virtual machine manager (GUI and CLI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+qorral-core = { path = "../qorral-core" }
+qorral-render = { path = "../qorral-render" }
+serde_json = "1.0.154"
+winit = "0.30.13"
+softbuffer = "0.4.8"
+raw-window-handle = "0.6.2"
+png = "0.18.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_System_Com",
+] }
+
+[lib]
+name = "qorral_app"
+path = "src/lib.rs"
+
+# `qorral`: the console CLI (no arguments: opens the app).
+[[bin]]
+name = "qorral"
+path = "src/main.rs"
+
+# `qorral-gui`: the window (no console window in release builds).
+[[bin]]
+name = "qorral-gui"
+path = "src/bin/qorral-gui.rs"
