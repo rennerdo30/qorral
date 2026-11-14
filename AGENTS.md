@@ -59,9 +59,17 @@ A change that breaks one of these is a defect, even if its tests pass.
 - Known QEMU quirks (from `lab.py`):
   - A guest-triggered reboot hangs under WHPX, so VMs run with `-no-reboot` and Qorral cold-boots them again.
   - WSL blocks local ports 44400–44601 while it runs, so check ports before a start.
-  - The Venus SDL window is black for Windows guests until the fork's fix lands.
-  - The QEMU build has no edk2 firmware yet.
-- **Hands off:** the renner.dev OS lab VMs (`E:/AgentData/renneros-lab/vms/*`), the QEMU fork and the virglrenderer fork belong to `claude-renner.dev-OS`. Ask that session; never modify them from here.
+  - The QEMU build has no libpng: `screendump` only as PPM.
+- **Ownership (owner decision 2026-11-15; handoff in Pair Desk HG-17):** Qorral owns everything VM-related and is the wrapper around QEMU for all projects. It owns:
+  - the QEMU fork (`E:/Development/winq-emu-qemu`, branch `rebase-master`);
+  - the virglrenderer fork (`E:/Development/winq-emu-virglrenderer`, branch `renner`);
+  - the deployed build in `E:/AgentData/winq-build/bin`;
+  - the lab data in `E:/AgentData/renneros-lab`.
+  Build recipe and traps: HG-17.
+- **Still careful:**
+  - Never touch a running lab VM.
+  - The owner's own test VM (`E:/AgentData/renneros-testvm`) changes only with the owner.
+  - Other projects' scripts (renner.dev OS `lab.py`; Remora's `winclone.ps1` interface) keep working until a switch is agreed with their session.
 
 ## Build (ffwd setup; details in HG-2)
 
