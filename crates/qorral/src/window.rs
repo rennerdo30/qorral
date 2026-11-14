@@ -35,6 +35,8 @@ pub enum UserEvent {
     SmokeTimeout,
     /// The Windows frame changed the maximise button or window state.
     Frame,
+    /// Another launch asked this window to come to the front.
+    Activate,
 }
 
 type Proxy = Arc<Mutex<EventLoopProxy<UserEvent>>>;
@@ -83,6 +85,22 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
     event_loop.set_control_flow(ControlFlow::Wait);
     trace(t0, "event loop built");
     let proxy: Proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
+    // One window per user: a second launch hands over to the first and exits.
+    // Agent smoke runs never take part.
+    let mut _instance_lock = None;
+    if !args.smoke {
+        let dir = Library::default_root().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        match crate::single::claim(&dir) {
+            Ok(crate::single::Instance::Handed) => return 0,
+            Ok(crate::single::Instance::First { _lock, listener }) => {
+                let p = proxy.clone();
+                crate::single::serve(listener, move || send(&p, UserEvent::Activate));
+                _instance_lock = Some(_lock);
+            }
+            Err(e) => eprintln!("qorral: single-instance check failed ({e}); continuing"),
+        }
+        trace(t0, "single instance claimed");
+    }
     let fonts_proxy = proxy.clone();
     let fonts = Some(std::thread::spawn(move || {
         let mut te = TextEngine::new();
@@ -303,6 +321,13 @@ impl App {
                 ui.selected = Some(id);
                 let vms = ui.vms.clone();
                 ui.set_vms(vms);
+            }
+            UserEvent::Activate => {
+                if let Some(g) = &self.gfx {
+                    g.window.set_minimized(false);
+                    g.window.set_visible(true);
+                    g.window.focus_window();
+                }
             }
             UserEvent::Frame => {
                 #[cfg(windows)]

@@ -6,6 +6,7 @@ pub mod cli;
 pub mod frame;
 pub mod model;
 pub mod platform;
+pub mod single;
 pub mod snapshot;
 pub mod theme;
 pub mod ui;
