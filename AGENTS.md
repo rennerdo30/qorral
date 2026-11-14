@@ -85,6 +85,7 @@ A change that breaks one of these is a defect, even if its tests pass.
 
 ## Process
 
+- **No sub-agents** (owner, 2026-11-15: "Don't use codex!!! Don't use subagents. You do all"): the main session does all work in this project itself: Qorral, the QEMU and virglrenderer forks, builds and tests. No Codex or other provider jobs, no `delegate_task`, no bridge jobs, no native subagents, including for reviews. This overrides the shared rules' delegation and separate-review-job steps for this project; the main reviews its own changes against the rules before merging and says so.
 - **Pair Desk:** project `hangar` (ids `HG-n`). Plans, handoff, backlog and evidence live there.
 - **Identity:** commit only as `rennerdo30 <9086097+rennerdo30@users.noreply.github.com>`. Push with explicit refs only: `git push origin HEAD:refs/heads/<branch>`. CI runs on GitHub-hosted runners (public repository rule).
 - **Licence:** permissively licensed dependencies only (MIT, Apache-2.0, BSD, Zlib, ISC). QEMU is GPL and ships as a separate program that Qorral drives, never linked into it.
