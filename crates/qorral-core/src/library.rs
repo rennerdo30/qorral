@@ -17,6 +17,10 @@ pub struct RunRecord {
     pub started: u64,
     /// Unix seconds; 0 = no time limit.
     pub deadline: u64,
+    /// Started with QEMU's own window.
+    pub window: bool,
+    /// gdb stub port, when started with `--gdb`.
+    pub gdb_port: Option<u16>,
 }
 
 #[derive(Clone, Debug)]

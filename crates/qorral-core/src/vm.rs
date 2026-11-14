@@ -80,6 +80,12 @@ pub struct VmConfig {
     pub port_forwards: Vec<String>,
     /// Extra QEMU arguments for power users, appended last.
     pub extra_args: Vec<String>,
+    /// Disk image outside the machine folder (adopted machines). Default:
+    /// `disk.qcow2` inside the folder.
+    pub disk_path: Option<String>,
+    /// UEFI variable store outside the machine folder. Default:
+    /// `efivars.qcow2` inside the folder.
+    pub efivars_path: Option<String>,
 }
 
 impl Default for VmConfig {
@@ -97,6 +103,8 @@ impl Default for VmConfig {
             iso: None,
             port_forwards: Vec::new(),
             extra_args: Vec::new(),
+            disk_path: None,
+            efivars_path: None,
         }
     }
 }

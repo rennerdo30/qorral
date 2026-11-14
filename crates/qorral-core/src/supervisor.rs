@@ -37,6 +37,29 @@ pub fn state(entry: &VmEntry) -> State {
     }
 }
 
+/// Brings an existing disk into the library without copying it: the new
+/// machine's `vm.json` points at the disk (and UEFI store) where they are.
+/// A missing UEFI store is created from the firmware template.
+pub fn adopt(lib: &Library, q: &QemuInstall, config: &VmConfig) -> Result<VmEntry, String> {
+    let disk = config.disk_path.as_deref().ok_or("adopt needs a disk image")?;
+    if !std::path::Path::new(disk).is_file() {
+        return Err(format!("no such disk image: {disk}"));
+    }
+    if let Some(e) = &config.efivars_path
+        && !std::path::Path::new(e).is_file()
+    {
+        return Err(format!("no such UEFI variable store: {e}"));
+    }
+    let entry = lib.create(config).map_err(|e| format!("cannot create the machine folder: {e}"))?;
+    if config.firmware == Firmware::Uefi && config.efivars_path.is_none() {
+        let vars = q.firmware_vars().ok_or("the QEMU build has no UEFI variable template (share/edk2-*-vars.fd)")?;
+        let mut c = Command::new(q.img());
+        c.args(["convert", "-q", "-f", "raw", "-O", "qcow2"]).arg(vars).arg(entry.dir.join("efivars.qcow2"));
+        check(run_with_timeout(c, Duration::from_secs(60)), "qemu-img convert")?;
+    }
+    Ok(entry)
+}
+
 /// Creates the VM folder, its disk and its UEFI variable store.
 pub fn create(lib: &Library, q: &QemuInstall, config: &VmConfig) -> Result<VmEntry, String> {
     let entry = lib.create(config).map_err(|e| format!("cannot create the VM folder: {e}"))?;
@@ -62,6 +85,21 @@ fn check(r: Result<std::process::Output, String>, what: &str) -> Result<(), Stri
     }
 }
 
+/// The host address and port of a `hostfwd` rule (`tcp:127.0.0.1:2222-:22`,
+/// `tcp::2222-:22`). `None` for rules this check does not understand.
+pub fn forward_host(rule: &str) -> Option<(String, u16)> {
+    let host = rule.split('-').next()?;
+    let mut parts = host.split(':');
+    let proto = parts.next()?;
+    if proto != "tcp" {
+        return None;
+    }
+    let addr = parts.next()?;
+    let port: u16 = parts.next()?.parse().ok()?;
+    let addr = if addr.is_empty() { "0.0.0.0" } else { addr };
+    Some((addr.to_string(), port))
+}
+
 fn port_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
@@ -74,15 +112,64 @@ pub fn pick_ports(lib: &Library) -> Option<Ports> {
     Some(Ports { qmp: free.next()?, agent: free.next()? })
 }
 
+/// Options for one start; nothing here is saved to `vm.json`.
+#[derive(Clone, Debug)]
+pub struct StartOptions {
+    pub display: Display,
+    /// Hard time limit; a watchdog ends the VM when it passes.
+    pub minutes: Option<u64>,
+    /// Install medium for this start only (boots first).
+    pub iso: Option<String>,
+    /// Extra port forwards for this start (`tcp:127.0.0.1:2222-:22`).
+    pub forwards: Vec<String>,
+    /// Extra QEMU arguments for this start, after the saved ones.
+    pub qemu_args: Vec<String>,
+    /// Open QEMU's gdb stub on this loopback port.
+    pub gdb: Option<u16>,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        StartOptions {
+            display: Display::Headless,
+            minutes: None,
+            iso: None,
+            forwards: Vec::new(),
+            qemu_args: Vec::new(),
+            gdb: None,
+        }
+    }
+}
+
+/// The settings QEMU actually gets: saved settings plus this start's options.
+pub fn effective_config(saved: &VmConfig, o: &StartOptions) -> VmConfig {
+    let mut c = saved.clone();
+    if let Some(iso) = &o.iso {
+        c.iso = Some(iso.clone());
+    }
+    c.port_forwards.extend(o.forwards.iter().cloned());
+    c.extra_args.extend(o.qemu_args.iter().cloned());
+    if let Some(port) = o.gdb {
+        c.extra_args.push("-gdb".into());
+        c.extra_args.push(format!("tcp:127.0.0.1:{port}"));
+    }
+    c
+}
+
 /// Starts QEMU detached (it survives Qorral; the next start finds it again
 /// through `run.json`), waits until QMP answers, and records the PID.
-pub fn start(
-    lib: &Library,
-    q: &QemuInstall,
-    entry: &VmEntry,
-    display: Display,
-    minutes: Option<u64>,
-) -> Result<RunRecord, String> {
+pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) -> Result<RunRecord, String> {
+    let (display, minutes) = (o.display, o.minutes);
+    let config = effective_config(&entry.config, o);
+    if config.gpu.accelerated() && display == Display::Headless {
+        return Err(format!(
+            "{} uses {} graphics, which needs a window for now: headless GPU display does not work yet \
+             (Venus with egl-headless crashes this QEMU build). Start it with a window, or switch the \
+             machine to basic graphics.",
+            entry.config.name,
+            config.gpu.label()
+        ));
+    }
     if state(entry) == State::Running {
         return Err(format!("{} is already running", entry.config.name));
     }
@@ -90,6 +177,16 @@ pub fn start(
     // reserves local ports while a distro runs and for about a minute after.
     // Qorral's range avoids WSL's usual 44400–44601, and still waits (bounded).
     let wait_end = Instant::now() + Duration::from_secs(180);
+    // Host ports of forwards must be free, or QEMU fails with a terse message.
+    for rule in &config.port_forwards {
+        if let Some((addr, port)) = forward_host(rule)
+            && std::net::TcpListener::bind((addr.as_str(), port)).is_err()
+        {
+            return Err(format!(
+                "host port {port} for the forward `{rule}` is in use by another program; pick another port"
+            ));
+        }
+    }
     let ports = loop {
         if let Some(p) = pick_ports(lib) {
             break p;
@@ -99,19 +196,16 @@ pub fn start(
         }
         std::thread::sleep(Duration::from_secs(2));
     };
-    let paths = VmPaths::in_dir(&entry.dir);
+    let paths = VmPaths::for_vm(&entry.dir, &config);
+    if !paths.disk.is_file() {
+        return Err(format!("the disk image is missing: {}", paths.disk.display()));
+    }
     let fw = q.firmware_code();
-    if entry.config.firmware == Firmware::Uefi && fw.is_none() {
+    if config.firmware == Firmware::Uefi && fw.is_none() {
         return Err("the QEMU build has no UEFI firmware (share/edk2-x86_64-code.fd)".into());
     }
-    let launch = Launch {
-        vm: &entry.config,
-        paths: &paths,
-        ports,
-        display,
-        accel: qemu::host_accel(),
-        firmware_code: fw.as_deref(),
-    };
+    let launch =
+        Launch { vm: &config, paths: &paths, ports, display, accel: qemu::host_accel(), firmware_code: fw.as_deref() };
     let args = qemu::args(&launch);
     let log_path = entry.dir.join("qemu.log");
     let mut log = std::fs::File::create(&log_path).map_err(|e| format!("cannot write qemu.log: {e}"))?;
@@ -122,7 +216,7 @@ pub fn start(
     let err_log = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(q.system());
     cmd.args(&args).current_dir(&entry.dir).stdin(Stdio::null()).stdout(log).stderr(err_log);
-    detach(&mut cmd, qemu::effective_display(&launch) == Display::Headless);
+    detach(&mut cmd, display == Display::Headless);
     let mut child = cmd.spawn().map_err(|e| format!("cannot start QEMU: {e}"))?;
     let pid = child.id();
     let run = RunRecord {
@@ -131,6 +225,8 @@ pub fn start(
         agent_port: ports.agent,
         started: now(),
         deadline: minutes.map_or(0, |m| now() + m * 60),
+        window: display == Display::Window,
+        gdb_port: o.gdb,
     };
     Library::save_run(entry, Some(&run)).map_err(|e| format!("cannot record the VM's PID: {e}"))?;
     // Fail loudly on a bad start: wait for QMP, or for QEMU to exit.
@@ -211,7 +307,7 @@ pub fn enforce_deadline(entry: &VmEntry) -> bool {
 
 /// QEMU's command line for this VM, for the "show command" view and `qorral info`.
 pub fn command_line(q: Option<&QemuInstall>, entry: &VmEntry) -> String {
-    let paths = VmPaths::in_dir(&entry.dir);
+    let paths = VmPaths::for_vm(&entry.dir, &entry.config);
     let fw = q.and_then(|q| q.firmware_code());
     let l = Launch {
         vm: &entry.config,
@@ -227,4 +323,35 @@ pub fn command_line(q: Option<&QemuInstall>, entry: &VmEntry) -> String {
     let exe = q.map_or("qemu-system-x86_64".to_string(), |q| q.system().display().to_string());
     let quote = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };
     std::iter::once(quote(&exe)).chain(qemu::args(&l).iter().map(|a| quote(a))).collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_rules_name_their_host_port() {
+        assert_eq!(forward_host("tcp:127.0.0.1:2222-:22"), Some(("127.0.0.1".into(), 2222)));
+        assert_eq!(forward_host("tcp::13390-:3390"), Some(("0.0.0.0".into(), 13390)));
+        assert_eq!(forward_host("udp:127.0.0.1:53-:53"), None);
+        assert_eq!(forward_host("garbage"), None);
+    }
+
+    #[test]
+    fn start_options_never_change_the_saved_settings() {
+        let saved = VmConfig { port_forwards: vec!["tcp:127.0.0.1:1-:1".into()], ..VmConfig::default() };
+        let o = StartOptions {
+            iso: Some("/x.iso".into()),
+            forwards: vec!["tcp:127.0.0.1:2-:2".into()],
+            qemu_args: vec!["-rtc".into(), "base=localtime".into()],
+            gdb: Some(1234),
+            ..StartOptions::default()
+        };
+        let eff = effective_config(&saved, &o);
+        assert_eq!(eff.port_forwards.len(), 2);
+        assert_eq!(eff.iso.as_deref(), Some("/x.iso"));
+        assert!(eff.extra_args.ends_with(&["-gdb".to_string(), "tcp:127.0.0.1:1234".to_string()]));
+        assert_eq!(saved.port_forwards.len(), 1, "saved settings stay untouched");
+        assert!(saved.iso.is_none());
+    }
 }

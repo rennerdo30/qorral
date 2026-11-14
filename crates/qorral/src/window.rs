@@ -245,8 +245,9 @@ impl App {
                         }
                         (_, None) => Err(format!("{id} no longer exists")),
                         (Some(q), Some(e)) => {
-                            let d = if window { Display::Window } else { Display::Headless };
-                            supervisor::start(&lib, &q, &e, d, None).map(|_| ())
+                            let display = if window { Display::Window } else { Display::Headless };
+                            let o = supervisor::StartOptions { display, ..Default::default() };
+                            supervisor::start(&lib, &q, &e, &o).map(|_| ())
                         }
                     };
                     if let Err(e) = r {

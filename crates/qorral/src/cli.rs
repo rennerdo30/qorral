@@ -22,9 +22,13 @@ usage: qorral [command] [options]      (no command: open the app)
 
   list                                  every machine and its state
   info <vm>                             settings, state and the QEMU command line
-  create <name> [--iso FILE] [--preset ID] [--cpus N] [--memory GB] [--disk GB]
-                [--gpu basic|opengl|vulkan|venus]
-  start <vm> [--window] [--minutes N]   start (headless unless --window); N = time limit
+  create <name> [--iso FILE] [--preset ID] [--cpus N] [--memory SIZE] [--disk GB]
+                [--gpu basic|opengl|vulkan|venus] [--bios] [--nvme]
+                [--forward RULE]... [--qemu-arg ARG]...      (saved with the machine)
+  adopt <name> --image DISK [--efivars FILE] [same options as create]
+                                        use an existing disk where it is (no copy)
+  start <vm> [--window] [--minutes N] [--iso FILE] [--forward RULE]... [--qemu-arg ARG]...
+             [--gdb PORT]               headless unless --window; options apply to this start only
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
   keys <vm> <combo>...                  press keys, e.g. ctrl-alt-delete ret
@@ -33,7 +37,8 @@ usage: qorral [command] [options]      (no command: open the app)
   presets                               systems with tuned defaults
 
 options: --json (machine-readable output), --home DIR (library location)
-exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine
+SIZE: 8 or 8G = 8 GB, 512M = 512 MB.  RULE: tcp:127.0.0.1:2222-:22
+exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine, 4 timed out
 ";
 
 struct Opts {
@@ -43,8 +48,23 @@ struct Opts {
 }
 
 /// Options that take a value.
-const VALUED: [&str; 10] =
-    ["--iso", "--preset", "--cpus", "--memory", "--disk", "--gpu", "--minutes", "--timeout", "--home", "--name"];
+const VALUED: [&str; 15] = [
+    "--iso",
+    "--preset",
+    "--cpus",
+    "--memory",
+    "--disk",
+    "--gpu",
+    "--minutes",
+    "--timeout",
+    "--home",
+    "--name",
+    "--forward",
+    "--qemu-arg",
+    "--gdb",
+    "--image",
+    "--efivars",
+];
 
 fn parse(args: Vec<String>) -> Result<Opts, String> {
     let mut o = Opts { json: false, rest: Vec::new(), flags: Vec::new() };
@@ -71,6 +91,10 @@ impl Opts {
     fn val(&self, n: &str) -> Option<&str> {
         self.flags.iter().find(|(k, _)| k == n).and_then(|(_, v)| v.as_deref())
     }
+    /// Every value of a repeatable option, in order.
+    fn vals(&self, n: &str) -> Vec<String> {
+        self.flags.iter().filter(|(k, _)| k == n).filter_map(|(_, v)| v.clone()).collect()
+    }
     fn num(&self, n: &str) -> Result<Option<u64>, String> {
         self.val(n).map(|v| v.parse::<u64>().map_err(|_| format!("{n} needs a number"))).transpose()
     }
@@ -80,6 +104,25 @@ enum Fail {
     Usage(String),
     NotFound(String),
     Failed(String),
+    Timeout(String),
+}
+
+/// `8`, `8G`, `8GB` → 8192 MiB; `512M` → 512 MiB.
+fn parse_memory(v: &str) -> Result<u32, String> {
+    let s = v.trim().to_ascii_lowercase();
+    let (num, mul) = if let Some(n) = s.strip_suffix("mb").or(s.strip_suffix('m')) {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix("gb").or(s.strip_suffix('g')) {
+        (n, 1024)
+    } else {
+        (s.as_str(), 1024)
+    };
+    let n: u32 = num.trim().parse().map_err(|_| format!("--memory: `{v}` is not a size like 8G or 512M"))?;
+    let mib = n.checked_mul(mul).ok_or("--memory is too large")?;
+    if !(256..=1024 * 1024).contains(&mib) {
+        return Err("--memory must be between 256M and 1024G".into());
+    }
+    Ok(mib)
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -102,6 +145,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "info" => info(&lib, &o),
         "create" => create(&lib, &o),
         "start" => start(&lib, &o),
+        "adopt" => adopt(&lib, &o),
         "stop" => stop(&lib, &o),
         "screenshot" => screenshot(&lib, &o),
         "keys" => keys(&lib, &o),
@@ -121,6 +165,10 @@ pub fn run(args: Vec<String>) -> i32 {
         Err(Fail::Failed(e)) => {
             report_error(o.json, "failed", &e);
             1
+        }
+        Err(Fail::Timeout(e)) => {
+            report_error(o.json, "timeout", &e);
+            4
         }
     }
 }
@@ -274,8 +322,25 @@ fn create(lib: &Library, o: &Opts) -> Result<(), Fail> {
     if let Some(n) = o.num("--cpus").map_err(Fail::Usage)? {
         c.cpus = n.clamp(1, 256) as u32;
     }
-    if let Some(n) = o.num("--memory").map_err(Fail::Usage)? {
-        c.memory_mib = (n.clamp(1, 1024) * 1024) as u32;
+    apply_hardware(&mut c, o)?;
+    let q = qemu()?;
+    let e = supervisor::create(lib, &q, &c).map_err(Fail::Failed)?;
+    if o.json {
+        print_json(json!({ "machine": entry_json(&e) }));
+    } else {
+        println!("Created {} ({}) in {}", e.config.name, e.id, e.dir.display());
+        println!("Start it:  qorral start {} --window", e.id);
+    }
+    Ok(())
+}
+
+/// Hardware options shared by `create` and `adopt` (saved with the machine).
+fn apply_hardware(c: &mut qorral_core::VmConfig, o: &Opts) -> Result<(), Fail> {
+    if let Some(n) = o.num("--cpus").map_err(Fail::Usage)? {
+        c.cpus = n.clamp(1, 256) as u32;
+    }
+    if let Some(m) = o.val("--memory") {
+        c.memory_mib = parse_memory(m).map_err(Fail::Usage)?;
     }
     if let Some(n) = o.num("--disk").map_err(Fail::Usage)? {
         c.disk_gib = n.clamp(1, 65536) as u32;
@@ -288,13 +353,35 @@ fn create(lib: &Library, o: &Opts) -> Result<(), Fail> {
             _ => return Err(Fail::Usage("--gpu is basic, opengl (gl) or vulkan (venus)".into())),
         };
     }
+    if o.flag("--bios") {
+        c.firmware = qorral_core::Firmware::Bios;
+    }
+    if o.flag("--nvme") {
+        c.disk_bus = qorral_core::DiskBus::Nvme;
+    }
+    c.port_forwards.extend(o.vals("--forward"));
+    c.extra_args.extend(o.vals("--qemu-arg"));
+    Ok(())
+}
+
+fn adopt(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let image = o.val("--image").ok_or_else(|| Fail::Usage("adopt needs --image DISK".into()))?;
+    let image = std::path::absolute(image).map_err(|e| Fail::Failed(e.to_string()))?;
+    let name = o.rest.first().cloned().ok_or_else(|| Fail::Usage("adopt needs a name".into()))?;
+    let preset = o.val("--preset");
+    let mut c = model::config_for(&name, preset, None);
+    c.disk_path = Some(image.display().to_string());
+    if let Some(v) = o.val("--efivars") {
+        let v = std::path::absolute(v).map_err(|e| Fail::Failed(e.to_string()))?;
+        c.efivars_path = Some(v.display().to_string());
+    }
+    apply_hardware(&mut c, o)?;
     let q = qemu()?;
-    let e = supervisor::create(lib, &q, &c).map_err(Fail::Failed)?;
+    let e = supervisor::adopt(lib, &q, &c).map_err(Fail::Failed)?;
     if o.json {
         print_json(json!({ "machine": entry_json(&e) }));
     } else {
-        println!("Created {} ({}) in {}", e.config.name, e.id, e.dir.display());
-        println!("Start it:  qorral start {} --window", e.id);
+        println!("Adopted {} ({}): disk stays at {}", e.config.name, e.id, image.display());
     }
     Ok(())
 }
@@ -304,7 +391,26 @@ fn start(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let q = qemu()?;
     let minutes = o.num("--minutes").map_err(Fail::Usage)?;
     let display = if o.flag("--window") { Display::Window } else { Display::Headless };
-    let run = supervisor::start(lib, &q, &e, display, minutes).map_err(Fail::Failed)?;
+    let iso = match o.val("--iso") {
+        Some(i) => {
+            let p = std::path::absolute(i).map_err(|err| Fail::Failed(err.to_string()))?;
+            if !p.is_file() {
+                return Err(Fail::Failed(format!("no such image: {}", p.display())));
+            }
+            Some(p.display().to_string())
+        }
+        None => None,
+    };
+    let gdb = o.num("--gdb").map_err(Fail::Usage)?.map(|p| p.clamp(1, 65535) as u16);
+    let opts = supervisor::StartOptions {
+        display,
+        minutes,
+        iso,
+        forwards: o.vals("--forward"),
+        qemu_args: o.vals("--qemu-arg"),
+        gdb,
+    };
+    let run = supervisor::start(lib, &q, &e, &opts).map_err(Fail::Failed)?;
     if minutes.is_some() {
         spawn_watchdog(&e.id, o.val("--home"));
     }
@@ -355,7 +461,7 @@ fn stop(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let timeout = Duration::from_secs(o.num("--timeout").map_err(Fail::Usage)?.unwrap_or(if force { 10 } else { 90 }));
     let st = supervisor::stop(&e, force, timeout).map_err(Fail::Failed)?;
     if st == State::Running {
-        return Err(Fail::Failed(format!(
+        return Err(Fail::Timeout(format!(
             "{} is still running after {} s (the guest ignored the shutdown request; use --force)",
             e.config.name,
             timeout.as_secs()
@@ -490,4 +596,28 @@ fn presets(o: &Opts) -> Result<(), Fail> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_sizes_parse_like_people_write_them() {
+        assert_eq!(parse_memory("8").unwrap(), 8192);
+        assert_eq!(parse_memory("8G").unwrap(), 8192);
+        assert_eq!(parse_memory("6gb").unwrap(), 6144);
+        assert_eq!(parse_memory("512M").unwrap(), 512);
+        assert!(parse_memory("100M").is_err(), "below the floor");
+        assert!(parse_memory("lots").is_err());
+    }
+
+    #[test]
+    fn repeatable_options_keep_every_value_in_order() {
+        let o =
+            parse(["vm", "--forward", "a", "--qemu-arg", "-rtc", "--forward", "b"].map(String::from).to_vec()).unwrap();
+        assert_eq!(o.vals("--forward"), ["a", "b"]);
+        assert_eq!(o.vals("--qemu-arg"), ["-rtc"]);
+        assert_eq!(o.rest, ["vm"]);
+    }
 }

@@ -31,6 +31,18 @@ impl VmPaths {
     pub fn in_dir(dir: &Path) -> VmPaths {
         VmPaths { disk: dir.join("disk.qcow2"), efivars: dir.join("efivars.qcow2"), serial_log: dir.join("serial.log") }
     }
+
+    /// The machine's files, honouring an adopted disk or UEFI store elsewhere.
+    pub fn for_vm(dir: &Path, vm: &VmConfig) -> VmPaths {
+        let mut p = VmPaths::in_dir(dir);
+        if let Some(d) = &vm.disk_path {
+            p.disk = PathBuf::from(d);
+        }
+        if let Some(e) = &vm.efivars_path {
+            p.efivars = PathBuf::from(e);
+        }
+        p
+    }
 }
 
 /// Loopback ports for one running VM.
@@ -61,10 +73,8 @@ pub struct Launch<'a> {
     pub firmware_code: Option<&'a Path>,
 }
 
-/// The arguments after the executable. Accelerated graphics need a window
-/// (they render through its GL context), so `Headless` with an accelerated
-/// GPU mode falls back to a window; the caller learns that from
-/// [`effective_display`].
+/// The arguments after the executable. QEMU opens a window only when
+/// `Display::Window` is asked for; Qorral never opens one on its own.
 pub fn args(l: &Launch) -> Vec<String> {
     let vm = l.vm;
     let mut a: Vec<String> = Vec::new();
@@ -102,10 +112,13 @@ pub fn args(l: &Launch) -> Vec<String> {
     push(&["-chardev", &format!("socket,id=qga,host=127.0.0.1,port={},server=on,wait=off", l.ports.agent)]);
     push(&["-device", "virtserialport,chardev=qga,name=org.qemu.guest_agent.0"]);
     push(&["-serial", &format!("file:{}", l.paths.serial_log.display())]);
-    let display = match (effective_display(l), vm.gpu.accelerated()) {
+    let display = match (l.display, vm.gpu.accelerated()) {
         (Display::Window, true) => "sdl,gl=on",
         (Display::Window, false) => "sdl",
-        (Display::Headless, _) => "none",
+        // Not usable yet: Venus with egl-headless crashes our build
+        // (2026-11-15). `supervisor::start` refuses this combination.
+        (Display::Headless, true) => "egl-headless",
+        (Display::Headless, false) => "none",
     };
     push(&["-display", display]);
     if vm.firmware == Firmware::Uefi
@@ -121,10 +134,6 @@ pub fn args(l: &Launch) -> Vec<String> {
     }
     a.extend(vm.extra_args.iter().cloned());
     a
-}
-
-pub fn effective_display(l: &Launch) -> Display {
-    if l.vm.gpu.accelerated() { Display::Window } else { l.display }
 }
 
 /// QEMU's `-name` and our folder names: letters, digits, `-` and `_` only.
@@ -174,11 +183,13 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_forces_a_gl_window_and_windows_guests_get_nvme() {
+    fn gpu_modes_never_open_a_window_unasked_and_windows_guests_get_nvme() {
         let vm = VmConfig { gpu: GpuMode::Vulkan, disk_bus: DiskBus::Nvme, ..VmConfig::default() };
         let a = launch_args(&vm, Display::Headless);
         assert!(has_pair(&a, "-device", "virtio-vga-gl,blob=on,hostmem=4G,venus=on"));
-        assert!(has_pair(&a, "-display", "sdl,gl=on"));
+        assert!(!a.iter().any(|x| x.starts_with("sdl")), "headless must never open a window");
+        let w = launch_args(&vm, Display::Window);
+        assert!(has_pair(&w, "-display", "sdl,gl=on"));
         assert!(has_pair(&a, "-device", "nvme,drive=hd0,serial=qorral-hd0,bootindex=1"));
     }
 
@@ -197,6 +208,14 @@ mod tests {
         assert!(has_pair(&a, "-nic", "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22"));
         assert!(has_pair(&a, "-display", "sdl"));
         assert_eq!(&a[a.len() - 2..], ["-rtc", "base=localtime"]);
+    }
+
+    #[test]
+    fn adopted_disks_are_used_in_place() {
+        let vm = VmConfig { disk_path: Some("/lab/vms/win/disk.qcow2".into()), ..VmConfig::default() };
+        let paths = VmPaths::for_vm(Path::new("/q/vms/win"), &vm);
+        assert_eq!(paths.disk, PathBuf::from("/lab/vms/win/disk.qcow2"));
+        assert_eq!(paths.efivars, PathBuf::from("/q/vms/win/efivars.qcow2"));
     }
 
     #[test]
