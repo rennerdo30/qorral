@@ -68,6 +68,45 @@ pub enum Action {
     },
 }
 
+/// How the window frame looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chrome {
+    /// Windows 11: the top bar is the title row; Qorral draws the caption
+    /// buttons and the frame keeps Snap Layouts on maximise (`frame.rs`).
+    Windows11,
+    /// macOS: transparent title bar, traffic lights inside the top bar.
+    MacInset,
+    /// The platform's own decorations (Linux for now).
+    Native,
+}
+
+impl Chrome {
+    pub fn for_platform() -> Chrome {
+        if cfg!(windows) {
+            Chrome::Windows11
+        } else if cfg!(target_os = "macos") {
+            Chrome::MacInset
+        } else {
+            Chrome::Native
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WinAction {
+    Minimize,
+    Close,
+}
+
+/// The title row for the frame's hit testing (physical client pixels).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TitleGeometry {
+    pub height: i32,
+    pub controls: Vec<(i32, i32)>,
+    pub buttons_left: i32,
+    pub max_button: (i32, i32),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hit {
     Search,
@@ -157,6 +196,14 @@ pub struct Ui {
     damage: Vec<Rect>,
     actions: Vec<Action>,
     pub stats: Stats,
+    pub chrome: Chrome,
+    cap_hover: Option<u8>,
+    cap_pressed: Option<u8>,
+    /// Maximise button (hovered, pressed), reported by the frame.
+    max_state: (bool, bool),
+    maximized: bool,
+    active: bool,
+    pub win_action: Option<WinAction>,
 }
 
 impl Ui {
@@ -181,6 +228,13 @@ impl Ui {
             damage: Vec::new(),
             actions: Vec::new(),
             stats: Stats::default(),
+            chrome: Chrome::for_platform(),
+            cap_hover: None,
+            cap_pressed: None,
+            max_state: (false, false),
+            maximized: false,
+            active: true,
+            win_action: None,
         };
         ui.layout();
         ui.invalidate();
@@ -277,6 +331,56 @@ impl Ui {
     fn bar_h(&self) -> i32 {
         self.p(60.0)
     }
+    /// The three caption buttons (Windows 11 chrome only).
+    fn caption_rect(&self) -> Rect {
+        if self.chrome != Chrome::Windows11 {
+            return Rect::default();
+        }
+        let w = 3 * self.p(46.0);
+        Rect::new(self.w - w, 0, w, self.bar_h() - 1)
+    }
+
+    /// Left inset for the macOS traffic lights.
+    fn mac_inset(&self) -> i32 {
+        if self.chrome == Chrome::MacInset { self.p(72.0) } else { 0 }
+    }
+
+    fn caption_button_at(&self, x: i32, y: i32) -> Option<u8> {
+        let r = self.caption_rect();
+        if r.is_empty() || !r.contains(x, y) {
+            return None;
+        }
+        Some((((x - r.x) / (r.w / 3).max(1)) as u8).min(2))
+    }
+
+    pub fn title_geometry(&self) -> TitleGeometry {
+        let c = self.caption_rect();
+        let bw = c.w / 3;
+        let s = self.search_rect();
+        TitleGeometry {
+            height: self.bar_h(),
+            controls: vec![(s.x, s.right())],
+            buttons_left: if c.is_empty() { i32::MAX } else { c.x },
+            max_button: (c.x + bw, c.x + 2 * bw),
+        }
+    }
+
+    /// The frame reported a change of the maximise button or window state.
+    pub fn set_frame_state(&mut self, max_state: (bool, bool), maximized: bool) {
+        if max_state != self.max_state || maximized != self.maximized {
+            self.max_state = max_state;
+            self.maximized = maximized;
+            self.damage.push(self.caption_rect());
+        }
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        if active != self.active {
+            self.active = active;
+            self.damage.push(self.caption_rect());
+        }
+    }
+
     fn pane_w(&self) -> i32 {
         if self.selected_index().is_some() && self.w >= self.p(1100.0) { self.p(384.0) } else { 0 }
     }
@@ -382,6 +486,11 @@ impl Ui {
     }
 
     pub fn pointer_move(&mut self, x: i32, y: i32) {
+        let ch = self.caption_button_at(x, y).filter(|&b| b != 1);
+        if ch != self.cap_hover {
+            self.cap_hover = ch;
+            self.damage.push(self.caption_rect());
+        }
         let h = self.hit(x, y);
         if h != self.hover {
             let rects: Vec<Rect> = [self.hover, h].into_iter().flatten().filter_map(|h| self.rect_of(h)).collect();
@@ -391,6 +500,9 @@ impl Ui {
     }
 
     pub fn pointer_leave(&mut self) {
+        if self.cap_hover.take().is_some() {
+            self.damage.push(self.caption_rect());
+        }
         if let Some(r) = self.hover.take().and_then(|h| self.rect_of(h)) {
             self.damage.push(r);
         }
@@ -404,10 +516,24 @@ impl Ui {
     }
 
     pub fn press(&mut self, x: i32, y: i32) {
+        if let Some(b) = self.caption_button_at(x, y).filter(|&b| b != 1) {
+            self.cap_pressed = Some(b);
+            self.damage.push(self.caption_rect());
+            return;
+        }
         self.pressed = self.hit(x, y);
     }
 
     pub fn release(&mut self, x: i32, y: i32) {
+        // A caption button acts only if the press started on it and the
+        // pointer is still over it, as on Windows.
+        if let Some(b) = self.cap_pressed.take() {
+            if self.caption_button_at(x, y) == Some(b) {
+                self.win_action = Some(if b == 0 { WinAction::Minimize } else { WinAction::Close });
+            }
+            self.damage.push(self.caption_rect());
+            return;
+        }
         let h = self.hit(x, y);
         if h.is_none() || h != self.pressed.take() {
             return;
@@ -585,7 +711,7 @@ impl Ui {
         cv.fill(Rect::new(0, bar.bottom() - 1, self.w, 1), th::BORDER);
         // Mark: a rounded square holding a ring with a tail (the Q).
         let m = self.p(26.0);
-        let mr = Rect::new(self.p(22.0), (bar.h - m) / 2, m, m);
+        let mr = Rect::new(self.mac_inset() + self.p(22.0), (bar.h - m) / 2, m, m);
         cv.fill_round(mr, self.fs(7.0), th::ACCENT);
         let (cx, cy) = (mr.x as f32 + m as f32 / 2.0, mr.y as f32 + m as f32 / 2.0);
         cv.ring(cx, cy, self.fs(6.6), self.fs(2.6), th::ACCENT_TEXT);
@@ -654,7 +780,8 @@ impl Ui {
         self.te.draw(cv, reg, self.fs(11.0), kc.x as f32 + (kc.w as f32 - kw) / 2.0, kb, "Ctrl K", th::MUTED, kw + 2.0);
 
         // Host status, right-aligned: the accelerator and the QEMU build.
-        let mut x = self.w as f32 - self.fs(24.0);
+        let right = if self.caption_rect().is_empty() { self.w } else { self.caption_rect().x };
+        let mut x = right as f32 - self.fs(18.0);
         let (ok, label) = if self.host.qemu_found {
             (true, format!("QEMU {}", self.host.qemu_version.clone().unwrap_or_default()))
         } else {
@@ -671,6 +798,55 @@ impl Ui {
             x -= self.fs(10.0);
             cv.fill_circle(x, bar.h as f32 / 2.0, self.fs(3.2), dot);
             x -= self.fs(22.0);
+        }
+        self.paint_caption(cv);
+    }
+
+    fn paint_caption(&mut self, cv: &mut Canvas) {
+        let r = self.caption_rect();
+        if r.is_empty() || cv.clip().intersect(r).is_empty() {
+            return;
+        }
+        let bw = r.w / 3;
+        let line = self.p(1.0).max(1);
+        let s = self.p(5.0);
+        for i in 0..3u8 {
+            let x = r.x + i as i32 * bw;
+            let b = Rect::new(x, r.y, if i == 2 { r.right() - x } else { bw }, r.h);
+            let (hover, pressed) = if i == 1 {
+                self.max_state
+            } else {
+                (self.cap_hover == Some(i), self.cap_pressed == Some(i) && self.cap_hover == Some(i))
+            };
+            let idle = if self.active { th::TEXT } else { th::FAINT };
+            let (fill, glyph) = match (i, hover, pressed) {
+                (2, true, true) => (0xA51E2D, 0xFFFFFF),
+                (2, true, false) => (0xC42B1C, 0xFFFFFF),
+                (_, true, true) => (0x23282F, th::TEXT),
+                (_, true, false) => (0x1A1E25, th::TEXT),
+                _ => (th::BAR, idle),
+            };
+            cv.fill(b, fill);
+            let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
+            match i {
+                0 => cv.fill(Rect::new(cx - s, cy, 2 * s, line), glyph),
+                1 if self.maximized => {
+                    let k = self.p(2.0);
+                    // Back window: only its top and right edges show.
+                    cv.fill(Rect::new(cx - s + k, cy - s, 2 * s - k, line), glyph);
+                    cv.fill(Rect::new(cx + s - line, cy - s, line, 2 * s - k), glyph);
+                    let front = Rect::new(cx - s, cy - s + k, 2 * s - k, 2 * s - k);
+                    cv.fill(front, fill);
+                    cv.stroke_rect(front, glyph);
+                }
+                1 => cv.stroke_rect(Rect::new(cx - s, cy - s, 2 * s, 2 * s), glyph),
+                _ => {
+                    let (fx, fy, fs) = (cx as f32, cy as f32, s as f32);
+                    let w = self.fs(1.0).max(1.0);
+                    cv.stroke(&[(fx - fs, fy - fs), (fx + fs, fy + fs)], w, glyph);
+                    cv.stroke(&[(fx - fs, fy + fs), (fx + fs, fy - fs)], w, glyph);
+                }
+            }
         }
     }
 

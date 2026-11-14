@@ -33,6 +33,8 @@ pub enum UserEvent {
     Toast(Option<String>),
     Select(String),
     SmokeTimeout,
+    /// The Windows frame changed the maximise button or window state.
+    Frame,
 }
 
 type Proxy = Arc<Mutex<EventLoopProxy<UserEvent>>>;
@@ -65,6 +67,9 @@ struct App {
     lib_root: std::path::PathBuf,
     qemu: Arc<Mutex<Option<QemuInstall>>>,
     exit_code: i32,
+    /// Title row last sent to the frame's hit test.
+    title_sent: Option<crate::ui::TitleGeometry>,
+    closing: bool,
 }
 
 pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
@@ -113,6 +118,8 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         lib_root,
         qemu,
         exit_code: 0,
+        title_sent: None,
+        closing: false,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("qorral: event loop failed: {e}");
@@ -297,11 +304,22 @@ impl App {
                 let vms = ui.vms.clone();
                 ui.set_vms(vms);
             }
+            UserEvent::Frame => {
+                #[cfg(windows)]
+                ui.set_frame_state(crate::frame::max_button_state(), crate::frame::is_zoomed());
+            }
             UserEvent::FontsReady | UserEvent::SmokeTimeout => {}
         }
     }
 
     fn after_input(&mut self) {
+        let win = self.ui.as_mut().and_then(|u| u.win_action.take());
+        if let (Some(a), Some(g)) = (win, &self.gfx) {
+            match a {
+                crate::ui::WinAction::Minimize => g.window.set_minimized(true),
+                crate::ui::WinAction::Close => self.closing = true,
+            }
+        }
         let actions = self.ui.as_mut().map(|u| u.take_actions()).unwrap_or_default();
         for a in actions {
             self.handle(a);
@@ -331,6 +349,18 @@ impl App {
         let force = buf.age() == 0;
         let mut cv = Canvas::new(&mut buf[..], w, h);
         let painted = ui.paint(&mut cv, force);
+        // The frame's hit test follows the painted title row.
+        let geo = ui.title_geometry();
+        if self.title_sent.as_ref() != Some(&geo) {
+            #[cfg(windows)]
+            crate::frame::set_caption(crate::frame::Caption {
+                height: geo.height,
+                controls: geo.controls.clone(),
+                buttons_left: geo.buttons_left,
+                max_button: geo.max_button,
+            });
+            self.title_sent = Some(geo);
+        }
         let rects: Vec<softbuffer::Rect> = painted
             .iter()
             .filter_map(|r| {
@@ -418,6 +448,12 @@ impl ApplicationHandler<UserEvent> for App {
                 attrs = attrs.with_skip_taskbar(true).with_active(false);
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            // The top bar runs under the traffic lights (Chrome::MacInset).
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true);
+        }
         let window = match el.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -442,6 +478,14 @@ impl ApplicationHandler<UserEvent> for App {
             _ => 0,
         };
         platform::dark_title_bar(hwnd);
+        // Before reading the size: removing the caption grows the client area.
+        #[cfg(windows)]
+        {
+            let p = self.proxy.clone();
+            if !crate::frame::install(hwnd, move || send(&p, UserEvent::Frame)) {
+                eprintln!("qorral: the modern frame could not be installed; using the system frame");
+            }
+        }
         let sz = window.inner_size();
         self.size = (sz.width as usize, sz.height as usize);
         let mut gfx = Gfx { window, surface, hwnd };
@@ -492,6 +536,9 @@ impl ApplicationHandler<UserEvent> for App {
             other => {
                 self.apply(other);
                 self.after_input();
+                if self.closing {
+                    el.exit();
+                }
             }
         }
     }
@@ -522,10 +569,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.after_input();
             }
-            WindowEvent::Focused(true) => {
+            WindowEvent::Focused(focused) => {
                 let remote = platform::is_remote_session();
                 if let Some(ui) = &mut self.ui {
-                    ui.set_remote(remote);
+                    ui.set_active(focused);
+                    if focused {
+                        ui.set_remote(remote);
+                    }
                 }
                 self.after_input();
             }
@@ -552,6 +602,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.after_input();
+                if self.closing {
+                    el.exit();
+                }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 let ctrl = self.mods.control_key() || self.mods.super_key();

@@ -2,6 +2,8 @@
 //! crate, and both drive VMs only through `qorral-core`.
 
 pub mod cli;
+#[cfg(windows)]
+pub mod frame;
 pub mod model;
 pub mod platform;
 pub mod snapshot;
