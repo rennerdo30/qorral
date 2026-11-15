@@ -58,6 +58,17 @@ impl QemuInstall {
         ["edk2-i386-vars.fd", "edk2-x86_64-vars.fd"].iter().map(|n| self.share.join(n)).find(|p| p.is_file())
     }
 
+    /// Whether windowless GL displays can work. On Windows they need an EGL
+    /// library next to QEMU (ANGLE's `libEGL.dll` + `libGLESv2.dll`); without
+    /// one, older builds crash at start. Elsewhere the system provides EGL.
+    pub fn has_egl(&self) -> bool {
+        if cfg!(windows) {
+            self.dir.join("libEGL.dll").is_file() && self.dir.join("libGLESv2.dll").is_file()
+        } else {
+            true
+        }
+    }
+
     /// `QEMU emulator version 11.1.90` → `11.1.90`.
     pub fn version(&self) -> Option<String> {
         let mut c = Command::new(self.system());

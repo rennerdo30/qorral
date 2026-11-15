@@ -2,10 +2,11 @@
 //!
 //! Contract (HG-12):
 //! - `--json` prints one JSON document on stdout; its schema has `"schema": 1`.
-//! - Exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine.
+//! - Exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine, 4 timed out.
 //! - Errors go to stderr. Nothing prompts; destructive commands need `--yes`.
 
 use crate::model;
+use qorral_core::guest::{AgentError, GuestAgent};
 use qorral_core::host::QemuInstall;
 use qorral_core::qemu::Display;
 use qorral_core::qmp::Qmp;
@@ -32,6 +33,9 @@ usage: qorral [command] [options]      (no command: open the app)
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
   keys <vm> <combo>...                  press keys, e.g. ctrl-alt-delete ret
+  exec <vm> [--timeout S] [--wait-agent S] -- <program> [args]...
+                                        run a program in the guest (QEMU guest agent; runs as
+                                        SYSTEM/root); a non-zero guest exit code exits 1
   delete <vm> --yes                     delete a stopped machine and its disk
   host                                  the QEMU build and accelerator in use
   presets                               systems with tuned defaults
@@ -45,10 +49,12 @@ struct Opts {
     json: bool,
     rest: Vec<String>,
     flags: Vec<(String, Option<String>)>,
+    /// Everything after a bare `--`, untouched (a guest command line).
+    tail: Vec<String>,
 }
 
 /// Options that take a value.
-const VALUED: [&str; 15] = [
+const VALUED: &[&str] = &[
     "--iso",
     "--preset",
     "--cpus",
@@ -64,13 +70,17 @@ const VALUED: [&str; 15] = [
     "--gdb",
     "--image",
     "--efivars",
+    "--wait-agent",
 ];
 
 fn parse(args: Vec<String>) -> Result<Opts, String> {
-    let mut o = Opts { json: false, rest: Vec::new(), flags: Vec::new() };
+    let mut o = Opts { json: false, rest: Vec::new(), flags: Vec::new(), tail: Vec::new() };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
-        if a == "--json" {
+        if a == "--" {
+            o.tail = it.collect();
+            break;
+        } else if a == "--json" {
             o.json = true;
         } else if VALUED.contains(&a.as_str()) {
             let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
@@ -105,6 +115,8 @@ enum Fail {
     NotFound(String),
     Failed(String),
     Timeout(String),
+    /// A guest command ran and exited with this non-zero code.
+    Guest(i64),
 }
 
 /// `8`, `8G`, `8GB` → 8192 MiB; `512M` → 512 MiB.
@@ -125,7 +137,28 @@ fn parse_memory(v: &str) -> Result<u32, String> {
     Ok(mib)
 }
 
+/// Global options may come before the command (`qorral --home D list`):
+/// they move behind it, where the parser reads every option.
+fn hoist_globals(mut args: Vec<String>) -> Vec<String> {
+    let mut globals = Vec::new();
+    loop {
+        match args.first().map(String::as_str) {
+            Some("--json") => globals.push(args.remove(0)),
+            Some("--home") if args.len() >= 2 => globals.extend(args.drain(..2)),
+            _ => break,
+        }
+    }
+    if args.is_empty() {
+        return args;
+    }
+    // After the command, but before a `--` guest command line.
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    args.splice(at..at, globals);
+    args
+}
+
 pub fn run(args: Vec<String>) -> i32 {
+    let args = hoist_globals(args);
     let Some(cmd) = args.first().cloned() else { return open_app() };
     if matches!(cmd.as_str(), "help" | "-h" | "--help") {
         print!("{USAGE}");
@@ -149,8 +182,9 @@ pub fn run(args: Vec<String>) -> i32 {
         "stop" => stop(&lib, &o),
         "screenshot" => screenshot(&lib, &o),
         "keys" => keys(&lib, &o),
+        "exec" => exec(&lib, &o),
         "delete" | "rm" => delete(&lib, &o),
-        "host" => host(&o),
+        "host" => host(&lib, &o),
         "presets" => presets(&o),
         "_watchdog" => watchdog(&lib, &o),
         other => Err(Fail::Usage(format!("unknown command `{other}`"))),
@@ -169,6 +203,12 @@ pub fn run(args: Vec<String>) -> i32 {
         Err(Fail::Timeout(e)) => {
             report_error(o.json, "timeout", &e);
             4
+        }
+        Err(Fail::Guest(code)) => {
+            if !o.json {
+                eprintln!("qorral: the guest command exited with code {code}");
+            }
+            1
         }
     }
 }
@@ -517,6 +557,36 @@ fn keys(lib: &Library, o: &Opts) -> Result<(), Fail> {
     Ok(())
 }
 
+fn exec(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let e = find(lib, o)?;
+    if o.tail.is_empty() {
+        return Err(Fail::Usage("exec needs a command after `--`, e.g. qorral exec win -- cmd /c ver".into()));
+    }
+    let run = e.run.as_ref().filter(|_| supervisor::state(&e) == State::Running);
+    let run = run.ok_or_else(|| Fail::Failed(format!("{} is not running", e.config.name)))?;
+    let timeout = Duration::from_secs(o.num("--timeout").map_err(Fail::Usage)?.unwrap_or(60));
+    let wait = Duration::from_secs(o.num("--wait-agent").map_err(Fail::Usage)?.unwrap_or(0));
+    let failed = |err: AgentError| match err {
+        AgentError::Timeout => {
+            Fail::Timeout(format!("the guest command did not finish within {} s", timeout.as_secs()))
+        }
+        other => Fail::Failed(other.to_string()),
+    };
+    let mut agent = GuestAgent::wait_connect(run.agent_port, wait).map_err(failed)?;
+    let out = agent.exec(&o.tail, timeout).map_err(failed)?;
+    if o.json {
+        let mut v = json!({ "exit_code": out.exit_code, "stdout": out.stdout, "stderr": out.stderr });
+        v["schema"] = json!(1);
+        v["ok"] = json!(out.exit_code == 0);
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+    } else {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(out.stdout.as_bytes());
+        let _ = std::io::stderr().write_all(out.stderr.as_bytes());
+    }
+    if out.exit_code == 0 { Ok(()) } else { Err(Fail::Guest(out.exit_code)) }
+}
+
 fn delete(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let e = find(lib, o)?;
     if supervisor::state(&e) == State::Running {
@@ -543,7 +613,7 @@ fn delete(lib: &Library, o: &Opts) -> Result<(), Fail> {
     Ok(())
 }
 
-fn host(o: &Opts) -> Result<(), Fail> {
+fn host(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let q = QemuInstall::find();
     let v = json!({
         "accel": qorral_core::qemu::host_accel(),
@@ -553,7 +623,7 @@ fn host(o: &Opts) -> Result<(), Fail> {
             "displays": q.displays(),
             "uefi": q.firmware_code().is_some(),
         })),
-        "library": Library::default_root(),
+        "library": lib.root,
     });
     if o.json {
         print_json(v);
@@ -571,7 +641,7 @@ fn host(o: &Opts) -> Result<(), Fail> {
             }
             None => println!("qemu         not found (set QORRAL_QEMU)"),
         }
-        println!("library      {}", Library::default_root().display());
+        println!("library      {}", lib.root.display());
     }
     Ok(())
 }
@@ -619,5 +689,23 @@ mod tests {
         assert_eq!(o.vals("--forward"), ["a", "b"]);
         assert_eq!(o.vals("--qemu-arg"), ["-rtc"]);
         assert_eq!(o.rest, ["vm"]);
+    }
+
+    #[test]
+    fn global_options_may_come_before_the_command() {
+        let a = hoist_globals(["--home", "/h", "--json", "exec", "win", "--", "cmd"].map(String::from).to_vec());
+        assert_eq!(a, ["exec", "win", "--home", "/h", "--json", "--", "cmd"]);
+        assert_eq!(hoist_globals(["list"].map(String::from).to_vec()), ["list"]);
+        assert!(hoist_globals(["--json"].map(String::from).to_vec()).is_empty());
+    }
+
+    #[test]
+    fn everything_after_double_dash_is_the_guest_command() {
+        let o =
+            parse(["win", "--timeout", "5", "--", "cmd", "/c", "--json", "ver"].map(String::from).to_vec()).unwrap();
+        assert_eq!(o.rest, ["win"]);
+        assert_eq!(o.val("--timeout"), Some("5"));
+        assert_eq!(o.tail, ["cmd", "/c", "--json", "ver"]);
+        assert!(!o.json, "--json after -- belongs to the guest command");
     }
 }

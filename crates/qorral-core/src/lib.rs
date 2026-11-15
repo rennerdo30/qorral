@@ -4,6 +4,7 @@
 //! Nothing here touches the UI. Everything that blocks (process starts, sockets,
 //! disk images) is called from worker threads by the app.
 
+pub mod guest;
 pub mod host;
 pub mod image;
 pub mod library;

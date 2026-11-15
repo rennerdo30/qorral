@@ -161,13 +161,14 @@ pub fn effective_config(saved: &VmConfig, o: &StartOptions) -> VmConfig {
 pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) -> Result<RunRecord, String> {
     let (display, minutes) = (o.display, o.minutes);
     let config = effective_config(&entry.config, o);
-    if config.gpu.accelerated() && display == Display::Headless {
+    if config.gpu.accelerated() && display == Display::Headless && !q.has_egl() {
         return Err(format!(
-            "{} uses {} graphics, which needs a window for now: headless GPU display does not work yet \
-             (Venus with egl-headless crashes this QEMU build). Start it with a window, or switch the \
-             machine to basic graphics.",
+            "{} uses {} graphics; without a window that needs an EGL library next to QEMU \
+             (libEGL.dll and libGLESv2.dll in {}), and this build has none. Start it with a window, \
+             or use a QEMU build that ships EGL.",
             entry.config.name,
-            config.gpu.label()
+            config.gpu.label(),
+            q.dir.display()
         ));
     }
     if state(entry) == State::Running {

@@ -56,9 +56,10 @@ pub struct Ports {
 /// How the guest screen is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
-    /// No window. Qorral shows the guest through QMP screenshots.
+    /// No window. Qorral shows the guest through QMP screenshots (later its
+    /// own D-Bus display client, HG-14).
     Headless,
-    /// QEMU's own window (the only path that shows accelerated guests today).
+    /// QEMU's own window.
     Window,
 }
 
@@ -115,8 +116,11 @@ pub fn args(l: &Launch) -> Vec<String> {
     let display = match (l.display, vm.gpu.accelerated()) {
         (Display::Window, true) => "sdl,gl=on",
         (Display::Window, false) => "sdl",
-        // Not usable yet: Venus with egl-headless crashes our build
-        // (2026-11-15). `supervisor::start` refuses this combination.
+        // GL without a window needs EGL (`QemuInstall::has_egl`; the
+        // supervisor checks it). On Windows the D-Bus display with GL: the
+        // tested path (Venus desktop, 2026-11-15) and the one Qorral's own
+        // display client will attach to. p2p: no session bus needed.
+        (Display::Headless, true) if cfg!(windows) => "dbus,p2p=yes,gl=on",
         (Display::Headless, true) => "egl-headless",
         (Display::Headless, false) => "none",
     };
@@ -188,6 +192,8 @@ mod tests {
         let a = launch_args(&vm, Display::Headless);
         assert!(has_pair(&a, "-device", "virtio-vga-gl,blob=on,hostmem=4G,venus=on"));
         assert!(!a.iter().any(|x| x.starts_with("sdl")), "headless must never open a window");
+        let headless = if cfg!(windows) { "dbus,p2p=yes,gl=on" } else { "egl-headless" };
+        assert!(has_pair(&a, "-display", headless));
         let w = launch_args(&vm, Display::Window);
         assert!(has_pair(&w, "-display", "sdl,gl=on"));
         assert!(has_pair(&a, "-device", "nvme,drive=hd0,serial=qorral-hd0,bootindex=1"));
