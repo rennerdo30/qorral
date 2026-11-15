@@ -4,7 +4,7 @@
 //! tested on this QEMU build. One pure function, so every mode is unit-tested
 //! without starting anything.
 
-use crate::vm::{DiskBus, Firmware, GpuMode, VmConfig};
+use crate::vm::{DiskBus, Firmware, GpuMode, NetworkMode, VmConfig};
 use std::path::{Path, PathBuf};
 
 /// Hardware acceleration per host OS.
@@ -101,9 +101,7 @@ pub fn args(l: &Launch) -> Vec<String> {
         },
     ]);
     push(&["-device", "qemu-xhci", "-device", "usb-tablet"]);
-    let nic: String = "user,model=virtio-net-pci".to_string()
-        + &vm.port_forwards.iter().map(|f| format!(",hostfwd={f}")).collect::<String>();
-    push(&["-nic", &nic]);
+    push(&["-nic", &nic_arg(vm)]);
     push(&["-audiodev", "none,id=snd0"]);
     // A guest-triggered warm reset hangs under WHPX: a guest reboot ends
     // QEMU instead, and Qorral cold-boots the VM again.
@@ -138,6 +136,19 @@ pub fn args(l: &Launch) -> Vec<String> {
     }
     a.extend(vm.extra_args.iter().cloned());
     a
+}
+
+/// The `-nic` value for the machine's network mode and forwards.
+pub fn nic_arg(vm: &VmConfig) -> String {
+    let mode = match vm.network {
+        NetworkMode::None => return "none".into(),
+        NetworkMode::Isolated => ",restrict=on",
+        // Our QEMU fork's option (libslirp `disable_host_loopback`).
+        NetworkMode::Internet => ",host-loopback=off",
+        NetworkMode::Nat => "",
+    };
+    format!("user,model=virtio-net-pci{mode}")
+        + &vm.port_forwards.iter().map(|f| format!(",hostfwd={f}")).collect::<String>()
 }
 
 /// QEMU's `-name` and our folder names: letters, digits, `-` and `_` only.
@@ -214,6 +225,19 @@ mod tests {
         assert!(has_pair(&a, "-nic", "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22"));
         assert!(has_pair(&a, "-display", "sdl"));
         assert_eq!(&a[a.len() - 2..], ["-rtc", "base=localtime"]);
+    }
+
+    #[test]
+    fn network_modes_map_to_nic_options() {
+        let fwd = vec!["tcp:127.0.0.1:2222-:22".to_string()];
+        let nic = |network| nic_arg(&VmConfig { network, port_forwards: fwd.clone(), ..VmConfig::default() });
+        assert_eq!(nic(NetworkMode::None), "none", "no card means no forwards either");
+        assert_eq!(nic(NetworkMode::Isolated), "user,model=virtio-net-pci,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22");
+        assert_eq!(
+            nic(NetworkMode::Internet),
+            "user,model=virtio-net-pci,host-loopback=off,hostfwd=tcp:127.0.0.1:2222-:22"
+        );
+        assert_eq!(nic(NetworkMode::Nat), "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22");
     }
 
     #[test]

@@ -104,6 +104,13 @@ impl Library {
         Ok(Self::load_dir(&dir))
     }
 
+    /// Rewrites `vm.json` (settings changes such as freezing onto a base).
+    pub fn save_config(entry: &VmEntry, config: &VmConfig) -> std::io::Result<()> {
+        let tmp = entry.dir.join("vm.json.tmp");
+        std::fs::write(&tmp, config.to_json())?;
+        std::fs::rename(tmp, entry.dir.join("vm.json"))
+    }
+
     pub fn save_run(entry: &VmEntry, run: Option<&RunRecord>) -> std::io::Result<()> {
         let p = entry.dir.join("run.json");
         match run {

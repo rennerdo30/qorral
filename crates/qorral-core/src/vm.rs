@@ -48,6 +48,51 @@ impl GpuMode {
     }
 }
 
+/// The guest's network. Port forwards apply to every mode except `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    /// No network card at all.
+    None,
+    /// User-mode NAT that reaches neither the internet nor the host; only
+    /// explicit port forwards connect.
+    Isolated,
+    /// User-mode NAT to the internet, but the guest cannot reach services
+    /// on the host's loopback (`127.0.0.1`). Services the host offers on
+    /// its LAN addresses stay reachable, as from any machine on that LAN.
+    Internet,
+    /// Plain user-mode NAT, host loopback included (QEMU's default).
+    #[default]
+    Nat,
+}
+
+impl NetworkMode {
+    pub const ALL: [NetworkMode; 4] =
+        [NetworkMode::None, NetworkMode::Isolated, NetworkMode::Internet, NetworkMode::Nat];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            NetworkMode::None => "none",
+            NetworkMode::Isolated => "isolated",
+            NetworkMode::Internet => "internet",
+            NetworkMode::Nat => "nat",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<NetworkMode> {
+        NetworkMode::ALL.into_iter().find(|m| m.id().eq_ignore_ascii_case(s.trim()))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NetworkMode::None => "No network",
+            NetworkMode::Isolated => "Isolated (forwards only)",
+            NetworkMode::Internet => "Internet, host blocked",
+            NetworkMode::Nat => "Network (NAT)",
+        }
+    }
+}
+
 /// The guest family. It picks defaults and the logo; it never limits what
 /// the user may change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +121,7 @@ pub struct VmConfig {
     pub gpu: GpuMode,
     /// Install medium; removed by the user (or the installer flow) after setup.
     pub iso: Option<String>,
+    pub network: NetworkMode,
     /// Port forwards in QEMU's `hostfwd` syntax, e.g. `tcp:127.0.0.1:2222-:22`.
     pub port_forwards: Vec<String>,
     /// Extra QEMU arguments for power users, appended last.
@@ -86,6 +132,9 @@ pub struct VmConfig {
     /// UEFI variable store outside the machine folder. Default:
     /// `efivars.qcow2` inside the folder.
     pub efivars_path: Option<String>,
+    /// The frozen base this machine's disk builds on (`qorral base`). A base
+    /// in use cannot be deleted.
+    pub base: Option<String>,
 }
 
 impl Default for VmConfig {
@@ -101,10 +150,12 @@ impl Default for VmConfig {
             disk_bus: DiskBus::Virtio,
             gpu: GpuMode::Basic,
             iso: None,
+            network: NetworkMode::Nat,
             port_forwards: Vec::new(),
             extra_args: Vec::new(),
             disk_path: None,
             efivars_path: None,
+            base: None,
         }
     }
 }
@@ -138,5 +189,15 @@ mod tests {
         let old = VmConfig::from_json(r#"{"name":"x","cpus":2,"future_field":true}"#).unwrap();
         assert_eq!((old.name.as_str(), old.cpus, old.memory_mib), ("x", 2, 8192));
         assert!(VmConfig::from_json("{not json").is_err());
+        assert_eq!(old.network, NetworkMode::Nat, "older files keep plain NAT");
+    }
+
+    #[test]
+    fn network_modes_parse_by_id() {
+        for m in NetworkMode::ALL {
+            assert_eq!(NetworkMode::parse(m.id()), Some(m));
+        }
+        assert_eq!(NetworkMode::parse(" Isolated "), Some(NetworkMode::Isolated));
+        assert_eq!(NetworkMode::parse("bridge"), None);
     }
 }

@@ -11,8 +11,9 @@ pub mod library;
 pub mod process;
 pub mod qemu;
 pub mod qmp;
+pub mod sandbox;
 pub mod supervisor;
 pub mod vm;
 
 pub use library::{Library, VmEntry};
-pub use vm::{DiskBus, Firmware, GpuMode, OsKind, VmConfig};
+pub use vm::{DiskBus, Firmware, GpuMode, NetworkMode, OsKind, VmConfig};

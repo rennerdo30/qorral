@@ -126,6 +126,8 @@ pub struct StartOptions {
     pub qemu_args: Vec<String>,
     /// Open QEMU's gdb stub on this loopback port.
     pub gdb: Option<u16>,
+    /// Network for this start instead of the saved one.
+    pub network: Option<crate::vm::NetworkMode>,
 }
 
 impl Default for StartOptions {
@@ -137,6 +139,7 @@ impl Default for StartOptions {
             forwards: Vec::new(),
             qemu_args: Vec::new(),
             gdb: None,
+            network: None,
         }
     }
 }
@@ -146,6 +149,9 @@ pub fn effective_config(saved: &VmConfig, o: &StartOptions) -> VmConfig {
     let mut c = saved.clone();
     if let Some(iso) = &o.iso {
         c.iso = Some(iso.clone());
+    }
+    if let Some(n) = o.network {
+        c.network = n;
     }
     c.port_forwards.extend(o.forwards.iter().cloned());
     c.extra_args.extend(o.qemu_args.iter().cloned());

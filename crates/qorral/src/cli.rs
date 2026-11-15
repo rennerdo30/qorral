@@ -10,8 +10,9 @@ use qorral_core::guest::{AgentError, GuestAgent};
 use qorral_core::host::QemuInstall;
 use qorral_core::qemu::Display;
 use qorral_core::qmp::Qmp;
+use qorral_core::sandbox::{self, Finished};
 use qorral_core::supervisor::{self, State};
-use qorral_core::{GpuMode, Library, VmEntry};
+use qorral_core::{GpuMode, Library, NetworkMode, VmEntry};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,12 +25,13 @@ usage: qorral [command] [options]      (no command: open the app)
   list                                  every machine and its state
   info <vm>                             settings, state and the QEMU command line
   create <name> [--iso FILE] [--preset ID] [--cpus N] [--memory SIZE] [--disk GB]
-                [--gpu basic|opengl|vulkan|venus] [--bios] [--nvme]
+                [--gpu basic|opengl|vulkan|venus] [--bios] [--nvme] [--network MODE]
                 [--forward RULE]... [--qemu-arg ARG]...      (saved with the machine)
   adopt <name> --image DISK [--efivars FILE] [same options as create]
                                         use an existing disk where it is (no copy)
-  start <vm> [--window] [--minutes N] [--iso FILE] [--forward RULE]... [--qemu-arg ARG]...
-             [--gdb PORT]               headless unless --window; options apply to this start only
+  start <vm> [--window] [--minutes N] [--iso FILE] [--network MODE] [--forward RULE]...
+             [--qemu-arg ARG]... [--gdb PORT]
+                                        headless unless --window; options apply to this start only
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
   keys <vm> <combo>...                  press keys, e.g. ctrl-alt-delete ret
@@ -37,11 +39,23 @@ usage: qorral [command] [options]      (no command: open the app)
                                         run a program in the guest (QEMU guest agent; runs as
                                         SYSTEM/root); a non-zero guest exit code exits 1
   delete <vm> --yes                     delete a stopped machine and its disk
+  base freeze <vm> [--name N]           freeze a stopped machine into a read-only base
+  base list                             bases and what uses them
+  base delete <name> --yes              delete a base nothing uses any more
+  sandbox run <base> [--profile FILE] [--network MODE] [--forward RULE]... [--minutes N]
+              [--window] [--cpus N] [--memory SIZE] [--qemu-arg ARG]... [-- startup command]
+                                        a disposable machine on a base; deleted when it ends
+  sandbox list                          running sandboxes (cleans up leftovers first)
+  sandbox stop <id> [--force]           end a sandbox (it is deleted)
+  sandbox keep <id>                     keep a sandbox as a normal machine when it ends
   host                                  the QEMU build and accelerator in use
   presets                               systems with tuned defaults
 
 options: --json (machine-readable output), --home DIR (library location)
 SIZE: 8 or 8G = 8 GB, 512M = 512 MB.  RULE: tcp:127.0.0.1:2222-:22
+MODE: none (no network; sandbox default), isolated (forwards only), internet (host blocked),
+      nat (machine default)
+Sandbox ids work with every machine command (info, exec, screenshot, keys, stop).
 exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine, 4 timed out
 ";
 
@@ -71,6 +85,8 @@ const VALUED: &[&str] = &[
     "--image",
     "--efivars",
     "--wait-agent",
+    "--network",
+    "--profile",
 ];
 
 fn parse(args: Vec<String>) -> Result<Opts, String> {
@@ -187,6 +203,9 @@ pub fn run(args: Vec<String>) -> i32 {
         "host" => host(&lib, &o),
         "presets" => presets(&o),
         "_watchdog" => watchdog(&lib, &o),
+        "base" => base_cmd(&lib, &o),
+        "sandbox" | "sbx" => sandbox_cmd(&lib, &o),
+        "_reap" => reap_cmd(&lib, &o),
         other => Err(Fail::Usage(format!("unknown command `{other}`"))),
     };
     match result {
@@ -254,12 +273,18 @@ fn open_app() -> i32 {
 
 fn find(lib: &Library, o: &Opts) -> Result<VmEntry, Fail> {
     let want = o.rest.first().ok_or_else(|| Fail::Usage("which machine?".into()))?;
-    let all = lib.list();
+    find_named(lib, want)
+}
+
+/// A machine by id or name; sandboxes count too.
+fn find_named(lib: &Library, want: &str) -> Result<VmEntry, Fail> {
+    let mut all = lib.list();
+    all.extend(sandbox::sandboxes(lib).list());
     all.iter()
-        .find(|e| &e.id == want)
+        .find(|e| e.id == want)
         .or_else(|| all.iter().find(|e| e.config.name.eq_ignore_ascii_case(want)))
         .cloned()
-        .ok_or_else(|| Fail::NotFound(format!("no machine `{want}` in {}", lib.root.display())))
+        .ok_or_else(|| Fail::NotFound(format!("no machine or sandbox `{want}` in {}", lib.root.display())))
 }
 
 fn qemu() -> Result<QemuInstall, Fail> {
@@ -289,6 +314,9 @@ fn entry_json(e: &VmEntry) -> Value {
         "firmware": c.firmware,
         "disk_bus": c.disk_bus,
         "iso": c.iso,
+        "network": c.network.id(),
+        "base": c.base,
+        "sandbox": sandbox::marker(e).map(|m| json!({ "base": m.base, "keep": m.keep, "created": m.created })),
         "pid": e.run.as_ref().filter(|_| supervisor::state(e) == State::Running).map(|r| r.pid),
         "qmp_port": e.run.as_ref().filter(|_| supervisor::state(e) == State::Running).map(|r| r.qmp_port),
         "dir": e.dir,
@@ -297,7 +325,9 @@ fn entry_json(e: &VmEntry) -> Value {
 }
 
 fn list(lib: &Library, o: &Opts) -> Result<(), Fail> {
-    let all = lib.list();
+    sandbox::sweep(lib);
+    let mut all = lib.list();
+    all.extend(sandbox::sandboxes(lib).list());
     if o.json {
         print_json(json!({ "machines": all.iter().map(entry_json).collect::<Vec<_>>() }));
         return Ok(());
@@ -399,6 +429,9 @@ fn apply_hardware(c: &mut qorral_core::VmConfig, o: &Opts) -> Result<(), Fail> {
     if o.flag("--nvme") {
         c.disk_bus = qorral_core::DiskBus::Nvme;
     }
+    if let Some(n) = network_opt(o)? {
+        c.network = n;
+    }
     c.port_forwards.extend(o.vals("--forward"));
     c.extra_args.extend(o.vals("--qemu-arg"));
     Ok(())
@@ -449,6 +482,7 @@ fn start(lib: &Library, o: &Opts) -> Result<(), Fail> {
         forwards: o.vals("--forward"),
         qemu_args: o.vals("--qemu-arg"),
         gdb,
+        network: network_opt(o)?,
     };
     let run = supervisor::start(lib, &q, &e, &opts).map_err(Fail::Failed)?;
     if minutes.is_some() {
@@ -465,9 +499,14 @@ fn start(lib: &Library, o: &Opts) -> Result<(), Fail> {
 /// A detached `qorral _watchdog <vm>` ends the VM at its time limit, even
 /// after this command has exited.
 fn spawn_watchdog(id: &str, home: Option<&str>) {
+    spawn_helper("_watchdog", id, home);
+}
+
+/// Starts a detached `qorral <cmd> <id>` that outlives this command.
+fn spawn_helper(cmd: &str, id: &str, home: Option<&str>) {
     let Ok(me) = std::env::current_exe() else { return };
     let mut c = std::process::Command::new(me);
-    c.args(["_watchdog", id]);
+    c.args([cmd, id]);
     if let Some(h) = home {
         c.args(["--home", h]);
     }
@@ -586,6 +625,266 @@ fn exec(lib: &Library, o: &Opts) -> Result<(), Fail> {
         let _ = std::io::stderr().write_all(out.stderr.as_bytes());
     }
     if out.exit_code == 0 { Ok(()) } else { Err(Fail::Guest(out.exit_code)) }
+}
+
+fn network_opt(o: &Opts) -> Result<Option<NetworkMode>, Fail> {
+    o.val("--network")
+        .map(|v| {
+            NetworkMode::parse(v)
+                .ok_or_else(|| Fail::Usage(format!("--network is none, isolated, internet or nat, not `{v}`")))
+        })
+        .transpose()
+}
+
+fn base_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let sub = o.rest.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "list" | "ls" => {
+            let bases = sandbox::list_bases(lib);
+            if o.json {
+                let v: Vec<Value> = bases
+                    .iter()
+                    .map(|b| {
+                        json!({
+                            "name": b.info.name, "created": b.info.created, "source": b.info.source,
+                            "dir": b.dir, "system": model::os_label(&b.info.template),
+                            "used_by": sandbox::base_users(lib, &b.info.name),
+                        })
+                    })
+                    .collect();
+                print_json(json!({ "bases": v }));
+            } else if bases.is_empty() {
+                println!("No bases yet. Freeze a stopped machine:  qorral base freeze <vm>");
+            } else {
+                for b in &bases {
+                    let users = sandbox::base_users(lib, &b.info.name);
+                    println!(
+                        "{:<24} {:<14} from {:<20} used by {}",
+                        b.info.name,
+                        model::os_label(&b.info.template),
+                        b.info.source,
+                        if users.is_empty() { "nothing".to_string() } else { users.join(", ") }
+                    );
+                }
+            }
+            Ok(())
+        }
+        "freeze" => {
+            let want = o.rest.get(1).ok_or_else(|| Fail::Usage("base freeze needs a machine".into()))?;
+            let vm = find_named(lib, want)?;
+            if sandbox::marker(&vm).is_some() {
+                return Err(Fail::Failed("a sandbox cannot be frozen; keep it first (sandbox keep)".into()));
+            }
+            let q = qemu()?;
+            let b = sandbox::freeze(lib, &q, &vm, o.val("--name")).map_err(Fail::Failed)?;
+            if o.json {
+                print_json(json!({ "base": { "name": b.info.name, "dir": b.dir, "source": b.info.source } }));
+            } else {
+                println!("Froze {} into base {} ({})", vm.config.name, b.info.name, b.dir.display());
+                println!("Start a sandbox:  qorral sandbox run {}", b.info.name);
+            }
+            Ok(())
+        }
+        "delete" | "rm" => {
+            let name = o.rest.get(1).ok_or_else(|| Fail::Usage("base delete needs a name".into()))?;
+            let b = sandbox::find_base(lib, name).ok_or_else(|| Fail::NotFound(format!("no base `{name}`")))?;
+            if !o.flag("--yes") {
+                return Err(Fail::Usage(format!(
+                    "this deletes base {} and its disk in {}; add --yes to confirm",
+                    b.info.name,
+                    b.dir.display()
+                )));
+            }
+            sandbox::delete_base(lib, &b).map_err(Fail::Failed)?;
+            if o.json {
+                print_json(json!({ "deleted": b.info.name }));
+            } else {
+                println!("Deleted base {}", b.info.name);
+            }
+            Ok(())
+        }
+        other => Err(Fail::Usage(format!("unknown base command `{other}` (freeze, list, delete)"))),
+    }
+}
+
+fn sandbox_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let sub = o.rest.first().map(String::as_str).unwrap_or("list");
+    let finished = sandbox::sweep(lib);
+    match sub {
+        "list" | "ls" => {
+            let all = sandbox::sandboxes(lib).list();
+            if o.json {
+                print_json(json!({
+                    "sandboxes": all.iter().map(entry_json).collect::<Vec<_>>(),
+                    "cleaned_up": finished.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                }));
+                return Ok(());
+            }
+            for (id, r) in &finished {
+                match r {
+                    Ok(Finished::Deleted) => println!("cleaned up {id}"),
+                    Ok(Finished::Kept(m)) => println!("kept {id} as machine {m}"),
+                    Err(e) => eprintln!("qorral: {id}: {e}"),
+                }
+            }
+            if all.is_empty() {
+                println!("No sandboxes running. Start one:  qorral sandbox run <base>");
+            }
+            for e in &all {
+                let m = sandbox::marker(e).unwrap_or_default();
+                println!(
+                    "{:<28} {:<8} base {:<20} {}{}",
+                    e.id,
+                    state_name(e),
+                    m.base,
+                    e.config.network.label(),
+                    if m.keep { "  (kept when it ends)" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        "run" | "start" => sandbox_run(lib, o),
+        "stop" => {
+            let id = o.rest.get(1).ok_or_else(|| Fail::Usage("sandbox stop needs an id".into()))?;
+            let e = sandbox_entry(lib, id)?;
+            let force = o.flag("--force");
+            let timeout =
+                Duration::from_secs(o.num("--timeout").map_err(Fail::Usage)?.unwrap_or(if force { 10 } else { 90 }));
+            if supervisor::stop(&e, force, timeout).map_err(Fail::Failed)? == State::Running {
+                return Err(Fail::Timeout(format!(
+                    "{} is still running after {} s (the guest ignored the shutdown request; use --force)",
+                    e.id,
+                    timeout.as_secs()
+                )));
+            }
+            // The reaper finishes it too; whoever comes first wins.
+            let r = match sandbox::finish(lib, &Library::load_dir(&e.dir)) {
+                Err(_) if !e.dir.exists() => Ok(Finished::Deleted),
+                r => r,
+            };
+            let r = r.map_err(Fail::Failed)?;
+            if o.json {
+                print_json(json!({ "sandbox": e.id, "result": finished_json(&r) }));
+            } else {
+                match r {
+                    Finished::Deleted => println!("Ended and deleted {}", e.id),
+                    Finished::Kept(m) => println!("Ended {}; kept as machine {m}", e.id),
+                }
+            }
+            Ok(())
+        }
+        "keep" => {
+            let id = o.rest.get(1).ok_or_else(|| Fail::Usage("sandbox keep needs an id".into()))?;
+            let e = sandbox_entry(lib, id)?;
+            sandbox::keep(&e).map_err(Fail::Failed)?;
+            if o.json {
+                print_json(json!({ "sandbox": e.id, "keep": true }));
+            } else {
+                println!("{} becomes a normal machine when it ends", e.id);
+            }
+            Ok(())
+        }
+        other => Err(Fail::Usage(format!("unknown sandbox command `{other}` (run, list, stop, keep)"))),
+    }
+}
+
+fn finished_json(r: &Finished) -> Value {
+    match r {
+        Finished::Deleted => json!({ "deleted": true }),
+        Finished::Kept(id) => json!({ "deleted": false, "machine": id }),
+    }
+}
+
+fn sandbox_entry(lib: &Library, id: &str) -> Result<VmEntry, Fail> {
+    sandbox::sandboxes(lib)
+        .list()
+        .into_iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| Fail::NotFound(format!("no sandbox `{id}`")))
+}
+
+fn sandbox_run(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let mut profile = match o.val("--profile") {
+        Some(p) => sandbox::Profile::load(Path::new(p)).map_err(Fail::Usage)?,
+        None => sandbox::Profile::default(),
+    };
+    // Command-line options override the profile.
+    if let Some(b) = o.rest.get(1) {
+        profile.base = b.clone();
+    }
+    if profile.base.is_empty() {
+        return Err(Fail::Usage("sandbox run needs a base (or --profile FILE)".into()));
+    }
+    let s = &mut profile.settings;
+    if let Some(n) = network_opt(o)? {
+        s.network = Some(n);
+    }
+    s.forwards.extend(o.vals("--forward"));
+    s.qemu_args.extend(o.vals("--qemu-arg"));
+    if let Some(n) = o.num("--cpus").map_err(Fail::Usage)? {
+        s.cpus = Some(n.clamp(1, 256) as u32);
+    }
+    if let Some(m) = o.val("--memory") {
+        s.memory_mib = Some(parse_memory(m).map_err(Fail::Usage)?);
+    }
+    if !o.tail.is_empty() {
+        s.startup = o.tail.clone();
+    }
+    if let Some(m) = o.num("--minutes").map_err(Fail::Usage)? {
+        profile.minutes = Some(m);
+    }
+    if o.flag("--window") {
+        profile.window = true;
+    }
+    let base = sandbox::find_base(lib, &profile.base)
+        .ok_or_else(|| Fail::NotFound(format!("no base `{}` (see qorral base list)", profile.base)))?;
+    let q = qemu()?;
+    let e = sandbox::create_sandbox(lib, &q, &base, &profile.settings).map_err(Fail::Failed)?;
+    let opts = supervisor::StartOptions {
+        display: if profile.window { Display::Window } else { Display::Headless },
+        minutes: profile.minutes,
+        ..supervisor::StartOptions::default()
+    };
+    let run = match supervisor::start(lib, &q, &e, &opts) {
+        Ok(r) => r,
+        Err(err) => {
+            let _ = sandbox::finish(lib, &Library::load_dir(&e.dir));
+            return Err(Fail::Failed(err));
+        }
+    };
+    // The reaper deletes the sandbox when QEMU is gone and enforces --minutes.
+    spawn_helper("_reap", &e.id, o.val("--home"));
+    if o.json {
+        print_json(json!({ "sandbox": entry_json(&Library::load_dir(&e.dir)), "pid": run.pid }));
+    } else {
+        println!(
+            "Started sandbox {} on {} (pid {}, {}){}",
+            e.id,
+            base.info.name,
+            run.pid,
+            e.config.network.label(),
+            profile.minutes.map_or(String::new(), |m| format!(", ends in {m} min"))
+        );
+        println!("It is deleted when it ends.  qorral sandbox stop {}   |   qorral sandbox keep {}", e.id, e.id);
+    }
+    Ok(())
+}
+
+/// `qorral _reap <id>`: detached; runs the startup command, then deletes
+/// the sandbox when its QEMU is gone.
+fn reap_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let id = o.rest.first().ok_or_else(|| Fail::Usage("_reap needs an id".into()))?.clone();
+    let e = sandbox_entry(lib, &id)?;
+    let startup = sandbox::marker(&e).map(|m| m.startup).unwrap_or_default();
+    if let (false, Some(run)) = (startup.is_empty(), e.run.clone()) {
+        std::thread::spawn(move || {
+            // Waits for the guest to boot; output goes nowhere (detached).
+            if let Ok(mut a) = GuestAgent::wait_connect(run.agent_port, Duration::from_secs(15 * 60)) {
+                let _ = a.exec(&startup, Duration::from_secs(5));
+            }
+        });
+    }
+    sandbox::reap(lib, &id).map(|_| ()).map_err(Fail::Failed)
 }
 
 fn delete(lib: &Library, o: &Opts) -> Result<(), Fail> {
