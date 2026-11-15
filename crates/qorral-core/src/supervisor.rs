@@ -6,7 +6,7 @@
 
 use crate::host::QemuInstall;
 use crate::library::{Library, RunRecord, VmEntry};
-use crate::process::{is_our_qemu, kill_qemu, run_with_timeout};
+use crate::process::{is_our_qemu, kill_qemu, run_with_timeout, wait_gone};
 use crate::qemu::{self, Display, Launch, Ports, VmPaths};
 use crate::qmp::Qmp;
 use crate::vm::{Firmware, VmConfig};
@@ -279,14 +279,19 @@ pub fn stop(entry: &VmEntry, force: bool, timeout: Duration) -> Result<State, St
         .and_then(|mut q| if force { q.quit() } else { q.powerdown() })
         .map_err(|e| e.to_string());
     let end = Instant::now() + timeout;
+    // "Stopped" means the disk is free again: wait for the process to be
+    // gone, not only for its exit code (a large VM takes a moment to unmap).
+    let gone = || wait_gone(run.pid, Duration::from_secs(30));
     while Instant::now() < end {
         if !is_our_qemu(run.pid) {
+            gone();
             let _ = Library::save_run(entry, None);
             return Ok(State::Stopped);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     if force && kill_qemu(run.pid) {
+        gone();
         let _ = Library::save_run(entry, None);
         return Ok(State::Stopped);
     }

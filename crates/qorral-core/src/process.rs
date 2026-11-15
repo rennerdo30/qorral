@@ -93,6 +93,41 @@ pub fn is_our_qemu(pid: u32) -> bool {
     pid != 0 && image_name(pid).is_some_and(|n| n.to_ascii_lowercase().starts_with("qemu-system"))
 }
 
+/// Waits up to `timeout` until `pid` has fully exited. On Windows the exit
+/// code is set before the process has released its memory and files (a
+/// large VM takes a moment), so "not alive" is not yet "disk unlocked".
+/// True when the process is gone.
+pub fn wait_gone(pid: u32, timeout: Duration) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+        // SAFETY: handle opened and closed here; waiting has no side effects.
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return true; // no such process any more
+            }
+            let ms = timeout.as_millis().min(u32::MAX as u128 - 1) as u32;
+            let done = WaitForSingleObject(h, ms) == WAIT_OBJECT_0;
+            CloseHandle(h);
+            done
+        }
+    }
+    #[cfg(unix)]
+    {
+        let end = std::time::Instant::now() + timeout;
+        // Not /proc/<pid>: an unreaped child keeps it; its exe link is gone.
+        while image_name(pid).is_some() {
+            if std::time::Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
+    }
+}
+
 /// Ends `pid`, but only after checking it is still a QEMU system emulator.
 pub fn kill_qemu(pid: u32) -> bool {
     if !is_our_qemu(pid) {
@@ -124,6 +159,20 @@ pub fn kill_qemu(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_gone_waits_for_the_process_object() {
+        assert!(!wait_gone(std::process::id(), Duration::from_millis(50)), "a live process is not gone");
+        let mut c = if cfg!(windows) { Command::new("cmd") } else { Command::new("true") };
+        if cfg!(windows) {
+            c.args(["/c", "exit", "0"]);
+        }
+        let mut child = c.spawn().expect("spawn a short-lived child");
+        let pid = child.id();
+        child.wait().expect("child exits");
+        drop(child); // releases our handle, so the process object can go
+        assert!(wait_gone(pid, Duration::from_secs(5)));
+    }
 
     #[test]
     fn our_own_process_is_not_qemu_and_a_dead_pid_is_not_alive() {
