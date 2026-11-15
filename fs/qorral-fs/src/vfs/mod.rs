@@ -414,6 +414,17 @@ impl Fuse for VirtioFs {
         inode.stat_fs()
     }
 
+    // qorral: FLUSH runs at every close(); written data already went to the
+    // host file, so there is nothing to do but check the handle. Upstream
+    // returns ENOSYS, which the Linux client accepts but the Windows client
+    // turns into an error (it maps errno 38 to "name too long").
+    fn flush(&self, request: &Request, arg: &fuse_flush_in) -> lx::Result<()> {
+        if self.is_synthetic_root_handle(request.node_id(), arg.fh) {
+            return Ok(());
+        }
+        self.get_file(arg.fh).map(|_| ())
+    }
+
     fn fsync(&self, _request: &Request, fh: u64, flags: u32) -> lx::Result<()> {
         let file = self.get_file(fh)?;
         let data_only = flags & FUSE_FSYNC_FDATASYNC != 0;
@@ -564,6 +575,20 @@ impl VirtioFs {
                 mode: VirtioFsMode::Aggregate(AggregateState::new()),
             }),
         }
+    }
+
+    /// qorral: `LOOKUP "."`, which the Windows virtio-fs client sends for a
+    /// directory's own attributes (Linux never does; the FUSE parser rejects
+    /// the name). Answers with the node itself and raises its lookup count
+    /// like any lookup, so the client's later FORGET stays balanced.
+    pub fn lookup_self(&self, node_id: u64) -> lx::Result<fuse_entry_out> {
+        if self.is_synthetic_root(node_id) {
+            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, self.synthetic_root_attr()));
+        }
+        let inode = self.get_inode(node_id)?;
+        let attr = inode.get_attr()?;
+        inode.inc_lookup();
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
     }
 
     fn lookup_helper(&self, inode: &VirtioFsInode, name: &lx::LxStr) -> lx::Result<fuse_entry_out> {

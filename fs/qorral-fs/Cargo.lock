@@ -288,6 +288,7 @@ name = "qorral-fs"
 version = "0.1.0"
 dependencies = [
  "fuse",
+ "libc",
  "lx",
  "lxutil",
  "parking_lot",
