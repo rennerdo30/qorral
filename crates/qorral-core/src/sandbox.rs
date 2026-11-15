@@ -264,6 +264,9 @@ pub struct SandboxSettings {
     pub qemu_args: Vec<String>,
     /// Startup command for the guest agent.
     pub startup: Vec<String>,
+    /// Host folders granted to the sandbox (`PATH`, `PATH:ro`, `PATH:rw`);
+    /// read-only unless marked `:rw`.
+    pub shares: Vec<String>,
 }
 
 /// A sandbox profile file: one JSON document a team shares to start the
@@ -282,8 +285,8 @@ pub struct Profile {
 }
 
 impl Profile {
-    const FIELDS: [&'static str; 9] =
-        ["base", "network", "forwards", "cpus", "memory_mib", "qemu_args", "startup", "minutes", "window"];
+    const FIELDS: [&'static str; 10] =
+        ["base", "network", "forwards", "cpus", "memory_mib", "qemu_args", "startup", "shares", "minutes", "window"];
 
     /// Parses a profile. Unknown fields are errors: a typo must not
     /// silently open up a locked-down sandbox.
@@ -324,6 +327,9 @@ pub fn create_sandbox(lib: &Library, q: &QemuInstall, base: &Base, s: &SandboxSe
         c.memory_mib = m.max(256);
     }
     c.extra_args.extend(s.qemu_args.iter().cloned());
+    // Sandboxes get no folder unless granted, and read-only unless `:rw`.
+    c.shares = s.shares.iter().map(|spec| crate::vm::Share::parse(spec, true)).collect();
+    supervisor::check_shares(&c.shares)?;
     let entry = sb.create(&c).map_err(|e| format!("cannot create the sandbox folder: {e}"))?;
     let result = (|| {
         write_marker(

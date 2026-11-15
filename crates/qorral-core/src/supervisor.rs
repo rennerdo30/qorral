@@ -128,6 +128,8 @@ pub struct StartOptions {
     pub gdb: Option<u16>,
     /// Network for this start instead of the saved one.
     pub network: Option<crate::vm::NetworkMode>,
+    /// Extra shared folders for this start.
+    pub shares: Vec<crate::vm::Share>,
 }
 
 impl Default for StartOptions {
@@ -140,6 +142,7 @@ impl Default for StartOptions {
             qemu_args: Vec::new(),
             gdb: None,
             network: None,
+            shares: Vec::new(),
         }
     }
 }
@@ -154,6 +157,7 @@ pub fn effective_config(saved: &VmConfig, o: &StartOptions) -> VmConfig {
         c.network = n;
     }
     c.port_forwards.extend(o.forwards.iter().cloned());
+    c.shares.extend(o.shares.iter().cloned());
     c.extra_args.extend(o.qemu_args.iter().cloned());
     if let Some(port) = o.gdb {
         c.extra_args.push("-gdb".into());
@@ -204,6 +208,7 @@ pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) 
         std::thread::sleep(Duration::from_secs(2));
     };
     let paths = VmPaths::for_vm(&entry.dir, &config);
+    write_shares(q, &config, &paths)?;
     if !paths.disk.is_file() {
         return Err(format!("the disk image is missing: {}", paths.disk.display()));
     }
@@ -253,6 +258,49 @@ pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Checks share names (unique, safe) and that every folder exists.
+pub fn check_shares(shares: &[crate::vm::Share]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for s in shares {
+        if !crate::vm::Share::valid_name(&s.name) {
+            return Err(format!("share name `{}`: use letters, digits, - _ . (up to 64)", s.name));
+        }
+        if !seen.insert(s.name.to_ascii_lowercase()) {
+            return Err(format!("two shares are called `{}`; give one another name", s.name));
+        }
+        if !std::path::Path::new(&s.path).is_dir() {
+            return Err(format!("shared folder `{}` does not exist: {}", s.name, s.path));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the list QEMU's file server reads, or removes a stale one.
+fn write_shares(q: &QemuInstall, config: &VmConfig, paths: &VmPaths) -> Result<(), String> {
+    if config.shares.is_empty() {
+        let _ = std::fs::remove_file(&paths.shares);
+        return Ok(());
+    }
+    if !q.has_fs_server() {
+        return Err(format!(
+            "{} shares folders, but this QEMU build has no file server (qorral_fs) next to it in {}",
+            config.name,
+            q.dir.display()
+        ));
+    }
+    check_shares(&config.shares)?;
+    let list: Vec<serde_json::Value> = config
+        .shares
+        .iter()
+        .map(|s| {
+            let path = std::path::absolute(&s.path).map(|p| p.display().to_string()).unwrap_or_else(|_| s.path.clone());
+            serde_json::json!({ "name": s.name, "path": path, "readonly": s.readonly })
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&serde_json::json!({ "shares": list })).unwrap_or_default();
+    std::fs::write(&paths.shares, text).map_err(|e| format!("cannot write {}: {e}", paths.shares.display()))
 }
 
 fn detach(cmd: &mut Command, headless: bool) {

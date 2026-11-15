@@ -30,7 +30,7 @@ usage: qorral [command] [options]      (no command: open the app)
   adopt <name> --image DISK [--efivars FILE] [same options as create]
                                         use an existing disk where it is (no copy)
   start <vm> [--window] [--minutes N] [--iso FILE] [--network MODE] [--forward RULE]...
-             [--qemu-arg ARG]... [--gdb PORT]
+             [--share PATH[:ro]]... [--qemu-arg ARG]... [--gdb PORT]
                                         headless unless --window; options apply to this start only
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
@@ -39,11 +39,15 @@ usage: qorral [command] [options]      (no command: open the app)
                                         run a program in the guest (QEMU guest agent; runs as
                                         SYSTEM/root); a non-zero guest exit code exits 1
   delete <vm> --yes                     delete a stopped machine and its disk
+  share add <vm> <folder> [--name N] [--readonly]
+                                        share a host folder (guest: mount -t virtiofs qorral DIR)
+  share remove <vm> <name> | share list <vm>
   base freeze <vm> [--name N]           freeze a stopped machine into a read-only base
   base list                             bases and what uses them
   base delete <name> --yes              delete a base nothing uses any more
   sandbox run <base> [--profile FILE] [--network MODE] [--forward RULE]... [--minutes N]
-              [--window] [--cpus N] [--memory SIZE] [--qemu-arg ARG]... [-- startup command]
+              [--window] [--cpus N] [--memory SIZE] [--share PATH[:rw]]... [--qemu-arg ARG]...
+              [-- startup command]           shares are read-only unless :rw
                                         a disposable machine on a base; deleted when it ends
   sandbox list                          running sandboxes (cleans up leftovers first)
   sandbox stop <id> [--force]           end a sandbox (it is deleted)
@@ -87,6 +91,7 @@ const VALUED: &[&str] = &[
     "--wait-agent",
     "--network",
     "--profile",
+    "--share",
 ];
 
 fn parse(args: Vec<String>) -> Result<Opts, String> {
@@ -204,6 +209,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "presets" => presets(&o),
         "_watchdog" => watchdog(&lib, &o),
         "base" => base_cmd(&lib, &o),
+        "share" | "shares" => share_cmd(&lib, &o),
         "sandbox" | "sbx" => sandbox_cmd(&lib, &o),
         "_reap" => reap_cmd(&lib, &o),
         other => Err(Fail::Usage(format!("unknown command `{other}`"))),
@@ -315,6 +321,7 @@ fn entry_json(e: &VmEntry) -> Value {
         "disk_bus": c.disk_bus,
         "iso": c.iso,
         "network": c.network.id(),
+        "shares": c.shares,
         "base": c.base,
         "sandbox": sandbox::marker(e).map(|m| json!({ "base": m.base, "keep": m.keep, "created": m.created })),
         "pid": e.run.as_ref().filter(|_| supervisor::state(e) == State::Running).map(|r| r.pid),
@@ -483,6 +490,7 @@ fn start(lib: &Library, o: &Opts) -> Result<(), Fail> {
         qemu_args: o.vals("--qemu-arg"),
         gdb,
         network: network_opt(o)?,
+        shares: o.vals("--share").iter().map(|v| qorral_core::Share::parse(v, false)).collect(),
     };
     let run = supervisor::start(lib, &q, &e, &opts).map_err(Fail::Failed)?;
     if minutes.is_some() {
@@ -634,6 +642,75 @@ fn network_opt(o: &Opts) -> Result<Option<NetworkMode>, Fail> {
                 .ok_or_else(|| Fail::Usage(format!("--network is none, isolated, internet or nat, not `{v}`")))
         })
         .transpose()
+}
+
+fn share_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let sub = o.rest.first().map(String::as_str).unwrap_or("list");
+    let vm_name = o.rest.get(1).ok_or_else(|| Fail::Usage(format!("share {sub} needs a machine")))?;
+    let e = find_named(lib, vm_name)?;
+    if sandbox::marker(&e).is_some() {
+        return Err(Fail::Usage("sandbox shares are set when it starts (sandbox run --share)".into()));
+    }
+    let mut c = e.config.clone();
+    match sub {
+        "list" | "ls" => {
+            if o.json {
+                print_json(json!({ "machine": e.id, "tag": qorral_core::qemu::SHARE_TAG, "shares": c.shares }));
+            } else if c.shares.is_empty() {
+                println!("{} shares no folders. Add one:  qorral share add {} <folder>", e.config.name, e.id);
+            } else {
+                for s in &c.shares {
+                    println!("{:<20} {:<3} {}", s.name, if s.readonly { "ro" } else { "rw" }, s.path);
+                }
+            }
+            return Ok(());
+        }
+        "add" => {
+            let folder = o.rest.get(2).ok_or_else(|| Fail::Usage("share add needs a folder".into()))?;
+            let path = std::path::absolute(folder).map_err(|err| Fail::Failed(err.to_string()))?;
+            let mut share = qorral_core::Share::parse(&path.display().to_string(), o.flag("--readonly"));
+            if let Some(n) = o.val("--name") {
+                share.name = n.to_string();
+            }
+            c.shares.retain(|s| !s.name.eq_ignore_ascii_case(&share.name));
+            c.shares.push(share.clone());
+            supervisor::check_shares(&c.shares).map_err(Fail::Failed)?;
+            Library::save_config(&e, &c).map_err(|err| Fail::Failed(err.to_string()))?;
+            if o.json {
+                print_json(json!({ "machine": e.id, "share": share }));
+            } else {
+                println!(
+                    "{} shares {} as `{}`{} (from its next start)",
+                    e.config.name,
+                    share.path,
+                    share.name,
+                    if share.readonly { ", read-only" } else { "" }
+                );
+                println!(
+                    "  Linux guest:   mount -t virtiofs {} /mnt/host   (then /mnt/host/{})",
+                    qorral_core::qemu::SHARE_TAG,
+                    share.name
+                );
+                println!("  Windows guest: install the virtio-fs driver and WinFsp; the shares appear as a drive");
+            }
+        }
+        "remove" | "rm" => {
+            let name = o.rest.get(2).ok_or_else(|| Fail::Usage("share remove needs a share name".into()))?;
+            let before = c.shares.len();
+            c.shares.retain(|s| !s.name.eq_ignore_ascii_case(name));
+            if c.shares.len() == before {
+                return Err(Fail::NotFound(format!("{} has no share `{name}`", e.config.name)));
+            }
+            Library::save_config(&e, &c).map_err(|err| Fail::Failed(err.to_string()))?;
+            if o.json {
+                print_json(json!({ "machine": e.id, "removed": name }));
+            } else {
+                println!("{} no longer shares `{name}` (from its next start)", e.config.name);
+            }
+        }
+        other => return Err(Fail::Usage(format!("unknown share command `{other}` (add, remove, list)"))),
+    }
+    Ok(())
 }
 
 fn base_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
@@ -821,6 +898,7 @@ fn sandbox_run(lib: &Library, o: &Opts) -> Result<(), Fail> {
     }
     s.forwards.extend(o.vals("--forward"));
     s.qemu_args.extend(o.vals("--qemu-arg"));
+    s.shares.extend(o.vals("--share"));
     if let Some(n) = o.num("--cpus").map_err(Fail::Usage)? {
         s.cpus = Some(n.clamp(1, 256) as u32);
     }

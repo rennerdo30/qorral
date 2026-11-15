@@ -69,6 +69,19 @@ impl QemuInstall {
         }
     }
 
+    /// Whether this build can share host folders (our virtio-fs device and
+    /// its file-server library next to QEMU).
+    pub fn has_fs_server(&self) -> bool {
+        let lib = if cfg!(windows) {
+            "qorral_fs.dll"
+        } else if cfg!(target_os = "macos") {
+            "libqorral_fs.dylib"
+        } else {
+            "libqorral_fs.so"
+        };
+        self.dir.join(lib).is_file()
+    }
+
     /// `QEMU emulator version 11.1.90` → `11.1.90`.
     pub fn version(&self) -> Option<String> {
         let mut c = Command::new(self.system());

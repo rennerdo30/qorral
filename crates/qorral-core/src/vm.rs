@@ -93,6 +93,46 @@ impl NetworkMode {
     }
 }
 
+/// A host folder the guest sees through virtio-fs as `<mount>/<name>`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Share {
+    pub name: String,
+    pub path: String,
+    pub readonly: bool,
+}
+
+impl Share {
+    /// `C:\Users\me\Docs` → `Docs`; `D:\` → `D`. Letters, digits, `-`, `_`, `.`.
+    pub fn name_for(path: &str) -> String {
+        let last = path.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().unwrap_or("");
+        let last = last.trim_end_matches(':');
+        let n: String = last
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+            .collect();
+        let n = n.trim_matches(['-', '.']).to_string();
+        if n.is_empty() { "share".into() } else { n }
+    }
+
+    /// `PATH`, `PATH:ro` or `PATH:rw` (a drive letter colon is part of the path).
+    pub fn parse(spec: &str, default_readonly: bool) -> Share {
+        let (path, readonly) = match spec.rsplit_once(':') {
+            Some((p, "ro")) if !p.is_empty() => (p, true),
+            Some((p, "rw")) if !p.is_empty() => (p, false),
+            _ => (spec, default_readonly),
+        };
+        Share { name: Share::name_for(path), path: path.to_string(), readonly }
+    }
+
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && !name.starts_with('.')
+    }
+}
+
 /// The guest family. It picks defaults and the logo; it never limits what
 /// the user may change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +164,8 @@ pub struct VmConfig {
     pub network: NetworkMode,
     /// Port forwards in QEMU's `hostfwd` syntax, e.g. `tcp:127.0.0.1:2222-:22`.
     pub port_forwards: Vec<String>,
+    /// Host folders shared with the guest (virtio-fs, tag `qorral`).
+    pub shares: Vec<Share>,
     /// Extra QEMU arguments for power users, appended last.
     pub extra_args: Vec<String>,
     /// Disk image outside the machine folder (adopted machines). Default:
@@ -152,6 +194,7 @@ impl Default for VmConfig {
             iso: None,
             network: NetworkMode::Nat,
             port_forwards: Vec::new(),
+            shares: Vec::new(),
             extra_args: Vec::new(),
             disk_path: None,
             efivars_path: None,
@@ -190,6 +233,16 @@ mod tests {
         assert_eq!((old.name.as_str(), old.cpus, old.memory_mib), ("x", 2, 8192));
         assert!(VmConfig::from_json("{not json").is_err());
         assert_eq!(old.network, NetworkMode::Nat, "older files keep plain NAT");
+    }
+
+    #[test]
+    fn share_specs_and_names() {
+        let s = Share::parse(r"C:\Users\me\My Docs:ro", false);
+        assert_eq!((s.name.as_str(), s.path.as_str(), s.readonly), ("My-Docs", r"C:\Users\me\My Docs", true));
+        let s = Share::parse(r"D:\", true);
+        assert_eq!((s.name.as_str(), s.path.as_str(), s.readonly), ("D", r"D:\", true), "drive colon is no suffix");
+        assert!(!Share::parse("/srv/data:rw", true).readonly);
+        assert!(Share::valid_name("work-1.2") && !Share::valid_name("../x") && !Share::valid_name(".hidden"));
     }
 
     #[test]

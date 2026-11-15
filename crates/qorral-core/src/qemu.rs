@@ -25,11 +25,18 @@ pub struct VmPaths {
     /// Per-VM UEFI variable store (qcow2, so disk snapshots include it).
     pub efivars: PathBuf,
     pub serial_log: PathBuf,
+    /// The share list QEMU's file server reads (written at start).
+    pub shares: PathBuf,
 }
 
 impl VmPaths {
     pub fn in_dir(dir: &Path) -> VmPaths {
-        VmPaths { disk: dir.join("disk.qcow2"), efivars: dir.join("efivars.qcow2"), serial_log: dir.join("serial.log") }
+        VmPaths {
+            disk: dir.join("disk.qcow2"),
+            efivars: dir.join("efivars.qcow2"),
+            serial_log: dir.join("serial.log"),
+            shares: dir.join("shares.json"),
+        }
     }
 
     /// The machine's files, honouring an adopted disk or UEFI store elsewhere.
@@ -102,6 +109,11 @@ pub fn args(l: &Launch) -> Vec<String> {
     ]);
     push(&["-device", "qemu-xhci", "-device", "usb-tablet"]);
     push(&["-nic", &nic_arg(vm)]);
+    if !vm.shares.is_empty() {
+        // QEMU's option syntax doubles commas inside a value.
+        let config = l.paths.shares.display().to_string().replace(',', ",,");
+        push(&["-device", &format!("virtio-fs-host-pci,tag={SHARE_TAG},config={config}")]);
+    }
     push(&["-audiodev", "none,id=snd0"]);
     // A guest-triggered warm reset hangs under WHPX: a guest reboot ends
     // QEMU instead, and Qorral cold-boots the VM again.
@@ -137,6 +149,9 @@ pub fn args(l: &Launch) -> Vec<String> {
     a.extend(vm.extra_args.iter().cloned());
     a
 }
+
+/// The virtio-fs tag every guest mounts: `mount -t virtiofs qorral /mnt/host`.
+pub const SHARE_TAG: &str = "qorral";
 
 /// The `-nic` value for the machine's network mode and forwards.
 pub fn nic_arg(vm: &VmConfig) -> String {
@@ -238,6 +253,27 @@ mod tests {
             "user,model=virtio-net-pci,host-loopback=off,hostfwd=tcp:127.0.0.1:2222-:22"
         );
         assert_eq!(nic(NetworkMode::Nat), "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22");
+    }
+
+    #[test]
+    fn shares_add_one_virtio_fs_device() {
+        let vm = VmConfig {
+            shares: vec![crate::vm::Share { name: "w".into(), path: r"C:\w".into(), readonly: false }],
+            ..VmConfig::default()
+        };
+        let paths = VmPaths::in_dir(Path::new("/vms/a,b"));
+        let a = args(&Launch {
+            vm: &vm,
+            paths: &paths,
+            ports: Ports { qmp: 1, agent: 2 },
+            display: Display::Headless,
+            accel: "whpx",
+            firmware_code: None,
+        });
+        let dev = a.iter().find(|x| x.starts_with("virtio-fs-host-pci")).expect("device");
+        assert!(dev.starts_with("virtio-fs-host-pci,tag=qorral,config="), "{dev}");
+        assert!(dev.contains("a,,b"), "commas doubled: {dev}");
+        assert!(!launch_args(&VmConfig::default(), Display::Headless).iter().any(|x| x.contains("virtio-fs")));
     }
 
     #[test]

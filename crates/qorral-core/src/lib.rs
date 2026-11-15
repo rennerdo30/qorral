@@ -16,4 +16,4 @@ pub mod supervisor;
 pub mod vm;
 
 pub use library::{Library, VmEntry};
-pub use vm::{DiskBus, Firmware, GpuMode, NetworkMode, OsKind, VmConfig};
+pub use vm::{DiskBus, Firmware, GpuMode, NetworkMode, OsKind, Share, VmConfig};
