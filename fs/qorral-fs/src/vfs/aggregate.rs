@@ -11,7 +11,6 @@
 //! the [`VirtioFs`] methods that operate on it; the core (direct-mode) file
 //! system lives in the crate root.
 
-use crate::vfs::ENTRY_TIMEOUT;
 use crate::vfs::VirtioFs;
 use crate::vfs::build_volume;
 use crate::vfs::inode::VirtioFsInode;
@@ -127,7 +126,11 @@ impl VirtioFs {
         registry.next_volume_id = volume_id.checked_add(1).ok_or(lx::Error::ENOSPC)?;
         registry.entries.push(ChildEntry {
             name: name.to_string(),
-            volume: Arc::new(VirtioFsVolume::new(volume, volume_id, readonly).with_host_root(&root)),
+            volume: Arc::new({
+                let v = VirtioFsVolume::new(volume, volume_id, readonly);
+                // qorral: the exact-case check needs the host folder.
+                if self.exact_case() { v.with_host_root(&root) } else { v }
+            }),
         });
         tracing::info!(name, volume_id, child_count = registry.entries.len(), "added aggregate virtio-fs child");
         Ok(())
@@ -216,7 +219,7 @@ impl VirtioFs {
         let (inode, stat) = VirtioFsInode::new(volume, PathBuf::new())?;
         let attr = inode.attr_from_stat(&stat);
         let (_, node_id) = self.insert_inode(inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     /// Reads the synthetic root directory, listing `.`, `..`, and each child.

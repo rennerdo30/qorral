@@ -53,6 +53,9 @@ struct VirtioFsInner {
     cache: CacheMode,
     /// qorral: the guest kernel agreed to the writeback cache (auto mode).
     writeback: std::sync::atomic::AtomicBool,
+    /// qorral: Linux name semantics (exact case). Off for Windows guests,
+    /// which expect case-insensitive names like their own file systems.
+    exact_case: bool,
 }
 
 /// qorral: how much the guest may cache. Entries (names) are never cached:
@@ -72,6 +75,7 @@ pub enum CacheMode {
 /// nothing to do here, and skipping it saves a round trip per close.
 const FOPEN_NOFLUSH: u32 = 1 << 5;
 const AUTO_ATTRIBUTE_TIMEOUT: Duration = Duration::from_secs(1);
+const AUTO_ENTRY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Distinguishes a single-share device from a multi-share aggregate.
 ///
@@ -309,7 +313,7 @@ impl Fuse for VirtioFs {
         let file = VirtioFsFile::new(file, new_inode);
         let fh = file_reservation.insert(file)?;
         Ok(CreateOut {
-            entry: fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr),
+            entry: fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr),
             open: fuse_open_out::new(fh, self.open_flags()),
         })
     }
@@ -324,7 +328,7 @@ impl Fuse for VirtioFs {
         let reservation = self.reserve_inode()?;
         let (new_inode, attr) = inode.mkdir(name, arg.mode, request.uid(), request.gid())?;
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     fn mknod(&self, request: &Request, name: &lx::LxStr, arg: &fuse_mknod_in) -> lx::Result<fuse_entry_out> {
@@ -338,7 +342,7 @@ impl Fuse for VirtioFs {
         let (new_inode, attr) = inode.mknod(name, arg.mode, request.uid(), request.gid(), arg.rdev)?;
 
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     fn symlink(&self, request: &Request, name: &lx::LxStr, target: &lx::LxStr) -> lx::Result<fuse_entry_out> {
@@ -352,7 +356,7 @@ impl Fuse for VirtioFs {
         let (new_inode, attr) = inode.symlink(name, target, request.uid(), request.gid())?;
 
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     fn link(&self, request: &Request, name: &lx::LxStr, target: u64) -> lx::Result<fuse_entry_out> {
@@ -370,7 +374,7 @@ impl Fuse for VirtioFs {
         target_inode.inc_lookup();
 
         // Use the target inode as the reply, with refreshed attributes.
-        Ok(fuse_entry_out::new(target, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(target, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     fn read_link(&self, request: &Request) -> lx::Result<lx::LxString> {
@@ -465,11 +469,28 @@ impl Fuse for VirtioFs {
         if !same_entry {
             check_no_case_twin(&new_inode, new_name)?;
         }
+        let old_path = inode.child_path(name)?;
+        let new_path = new_inode.child_path(new_name)?;
         inode.rename(name, &new_inode, new_name, flags)?;
         // A rename doesn't preserve inode identity on path-keyed volumes, so
         // evict both the vacated source path and the overwritten destination
         // path from the dedup map.
         let mut inodes = self.inner.inodes.write();
+        // qorral: the guest keeps its cached entries across a rename (entry
+        // timeout > 0 in auto mode), so the server's paths must follow: the
+        // replaced destination (if any) stops resolving, then the moved entry
+        // and everything below it get their new paths.
+        let volume = inode.volume_id();
+        for (node, other) in inodes.inodes_by_node_id.values.iter() {
+            if other.volume_id() == volume && other.path_is(&new_path) {
+                other.mark_replaced(*node);
+            }
+        }
+        for other in inodes.inodes_by_node_id.values.values() {
+            if other.volume_id() == volume {
+                other.rebase_path(&old_path, &new_path);
+            }
+        }
         if let Some(key) = inode.child_path_dedup_key(name) {
             inodes.evict_dedup_key(&key);
         }
@@ -632,6 +653,7 @@ impl VirtioFs {
                 mode: VirtioFsMode::Direct,
                 cache: CacheMode::Strict,
                 writeback: std::sync::atomic::AtomicBool::new(false),
+                exact_case: true,
             }),
         })
     }
@@ -651,6 +673,7 @@ impl VirtioFs {
                 mode: VirtioFsMode::Aggregate(AggregateState::new()),
                 cache: CacheMode::Strict,
                 writeback: std::sync::atomic::AtomicBool::new(false),
+                exact_case: true,
             }),
         }
     }
@@ -661,12 +684,27 @@ impl VirtioFs {
     /// like any lookup, so the client's later FORGET stays balanced.
     pub fn lookup_self(&self, node_id: u64) -> lx::Result<fuse_entry_out> {
         if self.is_synthetic_root(node_id) {
-            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, ENTRY_TIMEOUT, self.attr_timeout(), self.synthetic_root_attr()));
+            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, self.entry_timeout(), self.attr_timeout(), self.synthetic_root_attr()));
         }
         let inode = self.get_inode(node_id)?;
         let attr = inode.get_attr()?;
         inode.inc_lookup();
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(node_id, self.entry_timeout(), self.attr_timeout(), attr))
+    }
+
+    /// qorral: exact-case names (Linux guests); only before sharing.
+    pub fn set_exact_case(&mut self, on: bool) -> bool {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => {
+                inner.exact_case = on;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(crate) fn exact_case(&self) -> bool {
+        self.inner.exact_case
     }
 
     /// qorral: sets the cache mode; only before the file system is shared
@@ -678,6 +716,15 @@ impl VirtioFs {
                 true
             }
             None => false,
+        }
+    }
+
+    /// qorral: how long the guest may cache names (dentries). Strict: never.
+    /// Auto: 1 s; renames move the server's paths along (see rename).
+    pub(crate) fn entry_timeout(&self) -> Duration {
+        match self.inner.cache {
+            CacheMode::Strict => ENTRY_TIMEOUT,
+            CacheMode::Auto => AUTO_ENTRY_TIMEOUT,
         }
     }
 
@@ -720,7 +767,7 @@ impl VirtioFs {
             return Err(lx::Error::ENOENT);
         }
         let (_, new_inode_nr) = self.insert_inode(new_inode)?;
-        Ok(fuse_entry_out::new(new_inode_nr, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+        Ok(fuse_entry_out::new(new_inode_nr, self.entry_timeout(), self.attr_timeout(), attr))
     }
 
     /// Removes a file or directory.

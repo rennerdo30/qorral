@@ -11,6 +11,7 @@ use lxutil::LxVolume;
 use lxutil::PathBufExt;
 use parking_lot::RwLock;
 use std::ops::Deref;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -191,6 +192,28 @@ impl VirtioFsInode {
         self.lookup_count.fetch_add(1, Ordering::AcqRel);
         let mut path = self.path.write();
         *path = new_path;
+    }
+
+    /// qorral: after a rename, moves this inode's path from below `old` to
+    /// below `new` (component-wise). Returns whether it moved.
+    pub(crate) fn rebase_path(&self, old: &Path, new: &Path) -> bool {
+        let mut path = self.path.write();
+        let Ok(rest) = path.strip_prefix(old) else { return false };
+        *path = if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rest) };
+        true
+    }
+
+    /// qorral: points an inode whose entry was replaced by a rename at a name
+    /// that cannot exist, so node-based requests on it fail with ENOENT
+    /// instead of reaching the file that took its place.
+    pub(crate) fn mark_replaced(&self, node_id: u64) {
+        let mut path = self.path.write();
+        let gone = format!(".qorral-replaced-{node_id}-{:x}", self.inode_nr);
+        *path = path.with_file_name(gone);
+    }
+
+    pub(crate) fn path_is(&self, p: &Path) -> bool {
+        *self.path.read() == p
     }
 
     /// Increments the lookup count without updating the path.
@@ -431,7 +454,7 @@ impl VirtioFsInode {
     }
 
     /// Appends a child name to this inode's path.
-    fn child_path(&self, name: &LxStr) -> lx::Result<PathBuf> {
+    pub(crate) fn child_path(&self, name: &LxStr) -> lx::Result<PathBuf> {
         if !lx::s_isdir(self.file_type) {
             return Err(lx::Error::ENOTDIR);
         }
