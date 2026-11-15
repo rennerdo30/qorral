@@ -250,6 +250,7 @@ pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) 
 }
 
 fn detach(cmd: &mut Command, headless: bool) {
+    crate::process::keep_std_handles_private();
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

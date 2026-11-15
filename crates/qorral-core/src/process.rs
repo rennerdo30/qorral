@@ -93,6 +93,30 @@ pub fn is_our_qemu(pid: u32) -> bool {
     pid != 0 && image_name(pid).is_some_and(|n| n.to_ascii_lowercase().starts_with("qemu-system"))
 }
 
+/// Call before starting a process that outlives this one (QEMU, the
+/// watchdog). Windows children inherit every inheritable handle, and our own
+/// stdout is often a pipe (`qorral start --json | jq`): the reader would wait
+/// for the VM to exit. Clears the inherit flag on our standard handles; a
+/// child's own stdio is still set up explicitly by `Command`.
+pub fn keep_std_handles_private() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: plain Win32 calls on this process's own standard handles.
+            unsafe {
+                let h = GetStdHandle(which);
+                if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Waits up to `timeout` until `pid` has fully exited. On Windows the exit
 /// code is set before the process has released its memory and files (a
 /// large VM takes a moment), so "not alive" is not yet "disk unlocked".

@@ -472,6 +472,7 @@ fn spawn_watchdog(id: &str, home: Option<&str>) {
         c.args(["--home", h]);
     }
     qorral_core::process::no_console(&mut c);
+    qorral_core::process::keep_std_handles_private();
     let _ = c
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
