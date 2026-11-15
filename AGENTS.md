@@ -59,7 +59,7 @@ A change that breaks one of these is a defect, even if its tests pass.
 - Known QEMU quirks (from `lab.py`):
   - A guest-triggered reboot hangs under WHPX, so VMs run with `-no-reboot` and Qorral cold-boots them again.
   - WSL blocks local ports 44400–44601 while it runs, so check ports before a start.
-  - The QEMU build has no libpng: `screendump` only as PPM.
+  - Since 2026-11-15 the build has libpng and ships ANGLE (EGL) for windowless GL displays; Qorral still asks QEMU for PPM, which every build supports. The previous build stays in `E:/AgentData/winq-build/bin-prev-20261115` for rollback.
 - **Ownership (owner decision 2026-11-15; handoff in Pair Desk HG-17):** Qorral owns everything VM-related and is the wrapper around QEMU for all projects. It owns:
   - the QEMU fork (`E:/Development/winq-emu-qemu`, branch `rebase-master`);
   - the virglrenderer fork (`E:/Development/winq-emu-virglrenderer`, branch `renner`);

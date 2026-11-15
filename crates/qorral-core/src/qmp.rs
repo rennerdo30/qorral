@@ -129,7 +129,7 @@ impl Qmp {
     }
 
     /// Writes the guest screen to `path` as binary PPM. PPM is QEMU's built-in
-    /// format; PNG needs a QEMU built with libpng, which ours is not.
+    /// format; PNG needs a QEMU built with libpng, so PPM works with any build.
     pub fn screendump_ppm(&mut self, path: &std::path::Path) -> Result<(), QmpError> {
         let p = path.to_string_lossy();
         self.execute("screendump", Some(json!({ "filename": p }))).map(|_| ())
