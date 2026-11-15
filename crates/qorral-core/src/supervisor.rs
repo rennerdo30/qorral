@@ -299,7 +299,8 @@ fn write_shares(q: &QemuInstall, config: &VmConfig, paths: &VmPaths) -> Result<(
             serde_json::json!({ "name": s.name, "path": path, "readonly": s.readonly })
         })
         .collect();
-    let text = serde_json::to_string_pretty(&serde_json::json!({ "shares": list })).unwrap_or_default();
+    let text = serde_json::to_string_pretty(&serde_json::json!({ "shares": list, "cache": config.share_cache.id() }))
+        .unwrap_or_default();
     std::fs::write(&paths.shares, text).map_err(|e| format!("cannot write {}: {e}", paths.shares.display()))
 }
 

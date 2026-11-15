@@ -48,7 +48,27 @@ struct VirtioFsInner {
     inodes: RwLock<InodeMap>,
     files: RwLock<HandleMap<Arc<VirtioFsFile>>>,
     mode: VirtioFsMode,
+    /// qorral: guest-side caching (attributes and file data).
+    cache: CacheMode,
 }
+
+/// qorral: how much the guest may cache. Entries (names) are never cached:
+/// inodes are keyed by path here, so a cached entry would go stale on rename.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheMode {
+    /// Upstream's behaviour: attributes for 1 ms, no page cache (direct I/O).
+    #[default]
+    Strict,
+    /// Attributes for 1 s and the guest page cache, which the kernel drops
+    /// when a file's size or modification time changes (FUSE_AUTO_INVAL_DATA).
+    /// Host-side changes show up within a second.
+    Auto,
+}
+
+/// qorral: don't send FLUSH on close (Linux >= 5.17 honours it). FLUSH has
+/// nothing to do here, and skipping it saves a round trip per close.
+const FOPEN_NOFLUSH: u32 = 1 << 5;
+const AUTO_ATTRIBUTE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Distinguishes a single-share device from a multi-share aggregate.
 ///
@@ -138,7 +158,7 @@ impl Fuse for VirtioFs {
             inode.get_attr()?
         };
 
-        Ok(fuse_attr_out::new(ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_attr_out::new(self.attr_timeout(), attr))
     }
 
     fn get_statx(
@@ -163,7 +183,7 @@ impl Fuse for VirtioFs {
             inode.get_statx()?
         };
 
-        Ok(fuse_statx_out::new(ATTRIBUTE_TIMEOUT, flags, statx))
+        Ok(fuse_statx_out::new(self.attr_timeout(), flags, statx))
     }
 
     fn set_attr(&self, request: &Request, arg: &fuse_setattr_in) -> lx::Result<fuse_attr_out> {
@@ -192,7 +212,7 @@ impl Fuse for VirtioFs {
             inode.set_attr(arg, request.uid())?
         };
 
-        Ok(fuse_attr_out::new(ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_attr_out::new(self.attr_timeout(), attr))
     }
 
     fn lookup(&self, request: &Request, name: &lx::LxStr) -> lx::Result<fuse_entry_out> {
@@ -227,7 +247,7 @@ impl Fuse for VirtioFs {
         let fh = reservation.insert(file)?;
 
         // TODO: Optionally allow caching.
-        Ok(fuse_open_out::new(fh, FOPEN_DIRECT_IO))
+        Ok(fuse_open_out::new(fh, self.open_flags()))
     }
 
     fn create(&self, request: &Request, name: &lx::LxStr, arg: &fuse_create_in) -> lx::Result<CreateOut> {
@@ -248,8 +268,8 @@ impl Fuse for VirtioFs {
         let file = VirtioFsFile::new(file, new_inode);
         let fh = file_reservation.insert(file)?;
         Ok(CreateOut {
-            entry: fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr),
-            open: fuse_open_out::new(fh, FOPEN_DIRECT_IO),
+            entry: fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr),
+            open: fuse_open_out::new(fh, self.open_flags()),
         })
     }
 
@@ -262,7 +282,7 @@ impl Fuse for VirtioFs {
         let reservation = self.reserve_inode()?;
         let (new_inode, attr) = inode.mkdir(name, arg.mode, request.uid(), request.gid())?;
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     fn mknod(&self, request: &Request, name: &lx::LxStr, arg: &fuse_mknod_in) -> lx::Result<fuse_entry_out> {
@@ -275,7 +295,7 @@ impl Fuse for VirtioFs {
         let (new_inode, attr) = inode.mknod(name, arg.mode, request.uid(), request.gid(), arg.rdev)?;
 
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     fn symlink(&self, request: &Request, name: &lx::LxStr, target: &lx::LxStr) -> lx::Result<fuse_entry_out> {
@@ -288,7 +308,7 @@ impl Fuse for VirtioFs {
         let (new_inode, attr) = inode.symlink(name, target, request.uid(), request.gid())?;
 
         let (_, node_id) = reservation.insert(new_inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     fn link(&self, request: &Request, name: &lx::LxStr, target: u64) -> lx::Result<fuse_entry_out> {
@@ -305,7 +325,7 @@ impl Fuse for VirtioFs {
         target_inode.inc_lookup();
 
         // Use the target inode as the reply, with refreshed attributes.
-        Ok(fuse_entry_out::new(target, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(target, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     fn read_link(&self, request: &Request) -> lx::Result<lx::LxString> {
@@ -556,6 +576,7 @@ impl VirtioFs {
                 inodes: RwLock::new(inodes),
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Direct,
+                cache: CacheMode::Strict,
             }),
         })
     }
@@ -573,6 +594,7 @@ impl VirtioFs {
                 inodes: RwLock::new(InodeMap::new(true)),
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Aggregate(AggregateState::new()),
+                cache: CacheMode::Strict,
             }),
         }
     }
@@ -583,18 +605,47 @@ impl VirtioFs {
     /// like any lookup, so the client's later FORGET stays balanced.
     pub fn lookup_self(&self, node_id: u64) -> lx::Result<fuse_entry_out> {
         if self.is_synthetic_root(node_id) {
-            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, self.synthetic_root_attr()));
+            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, ENTRY_TIMEOUT, self.attr_timeout(), self.synthetic_root_attr()));
         }
         let inode = self.get_inode(node_id)?;
         let attr = inode.get_attr()?;
         inode.inc_lookup();
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
+    }
+
+    /// qorral: sets the cache mode; only before the file system is shared
+    /// (returns false once a clone exists).
+    pub fn set_cache(&mut self, cache: CacheMode) -> bool {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => {
+                inner.cache = cache;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// qorral: attribute timeout for the cache mode.
+    pub(crate) fn attr_timeout(&self) -> Duration {
+        match self.inner.cache {
+            CacheMode::Strict => ATTRIBUTE_TIMEOUT,
+            CacheMode::Auto => AUTO_ATTRIBUTE_TIMEOUT,
+        }
+    }
+
+    /// qorral: open flags for the cache mode.
+    fn open_flags(&self) -> u32 {
+        FOPEN_NOFLUSH
+            | match self.inner.cache {
+                CacheMode::Strict => FOPEN_DIRECT_IO,
+                CacheMode::Auto => 0,
+            }
     }
 
     fn lookup_helper(&self, inode: &VirtioFsInode, name: &lx::LxStr) -> lx::Result<fuse_entry_out> {
         let (new_inode, attr) = inode.lookup_child(name)?;
         let (_, new_inode_nr) = self.insert_inode(new_inode)?;
-        Ok(fuse_entry_out::new(new_inode_nr, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(new_inode_nr, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     /// Removes a file or directory.

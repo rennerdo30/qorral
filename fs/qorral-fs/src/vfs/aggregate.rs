@@ -11,7 +11,6 @@
 //! the [`VirtioFs`] methods that operate on it; the core (direct-mode) file
 //! system lives in the crate root.
 
-use crate::vfs::ATTRIBUTE_TIMEOUT;
 use crate::vfs::ENTRY_TIMEOUT;
 use crate::vfs::VirtioFs;
 use crate::vfs::build_volume;
@@ -216,7 +215,7 @@ impl VirtioFs {
         let (inode, stat) = VirtioFsInode::new(volume, PathBuf::new())?;
         let attr = inode.attr_from_stat(&stat);
         let (_, node_id) = self.insert_inode(inode)?;
-        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, ATTRIBUTE_TIMEOUT, attr))
+        Ok(fuse_entry_out::new(node_id, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }
 
     /// Reads the synthetic root directory, listing `.`, `..`, and each child.

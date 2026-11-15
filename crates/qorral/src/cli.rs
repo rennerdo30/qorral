@@ -42,6 +42,8 @@ usage: qorral [command] [options]      (no command: open the app)
   share add <vm> <folder> [--name N] [--readonly]
                                         share a host folder (guest: mount -t virtiofs qorral DIR)
   share remove <vm> <name> | share list <vm>
+  share cache <vm> auto|strict          auto (default): fast with small files, host changes
+                                        show up within a second; strict: at once, slower
   base freeze <vm> [--name N]           freeze a stopped machine into a read-only base
   base list                             bases and what uses them
   base delete <name> --yes              delete a base nothing uses any more
@@ -655,7 +657,12 @@ fn share_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
     match sub {
         "list" | "ls" => {
             if o.json {
-                print_json(json!({ "machine": e.id, "tag": qorral_core::qemu::SHARE_TAG, "shares": c.shares }));
+                print_json(json!({
+                    "machine": e.id,
+                    "tag": qorral_core::qemu::SHARE_TAG,
+                    "cache": c.share_cache.id(),
+                    "shares": c.shares,
+                }));
             } else if c.shares.is_empty() {
                 println!("{} shares no folders. Add one:  qorral share add {} <folder>", e.config.name, e.id);
             } else {
@@ -708,7 +715,18 @@ fn share_cmd(lib: &Library, o: &Opts) -> Result<(), Fail> {
                 println!("{} no longer shares `{name}` (from its next start)", e.config.name);
             }
         }
-        other => return Err(Fail::Usage(format!("unknown share command `{other}` (add, remove, list)"))),
+        "cache" => {
+            let v = o.rest.get(2).ok_or_else(|| Fail::Usage("share cache needs strict or auto".into()))?;
+            c.share_cache = qorral_core::ShareCache::parse(v)
+                .ok_or_else(|| Fail::Usage(format!("share cache is strict or auto, not `{v}`")))?;
+            Library::save_config(&e, &c).map_err(|err| Fail::Failed(err.to_string()))?;
+            if o.json {
+                print_json(json!({ "machine": e.id, "cache": c.share_cache.id() }));
+            } else {
+                println!("{} caches shared folders: {} (from its next start)", e.config.name, c.share_cache.id());
+            }
+        }
+        other => return Err(Fail::Usage(format!("unknown share command `{other}` (add, remove, list, cache)"))),
     }
     Ok(())
 }

@@ -133,6 +133,32 @@ impl Share {
     }
 }
 
+/// How much the guest may cache shared folders.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareCache {
+    /// Every change on the host is visible at once; each access asks the host.
+    Strict,
+    /// Attributes cached for a second and file data in the guest's page
+    /// cache (dropped when the file changes): much faster with many small
+    /// files; host-side changes show up within a second. The default, as
+    /// virtiofsd's `cache=auto`.
+    #[default]
+    Auto,
+}
+
+impl ShareCache {
+    pub fn id(self) -> &'static str {
+        match self {
+            ShareCache::Strict => "strict",
+            ShareCache::Auto => "auto",
+        }
+    }
+    pub fn parse(s: &str) -> Option<ShareCache> {
+        [ShareCache::Strict, ShareCache::Auto].into_iter().find(|c| c.id().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 /// The guest family. It picks defaults and the logo; it never limits what
 /// the user may change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +192,7 @@ pub struct VmConfig {
     pub port_forwards: Vec<String>,
     /// Host folders shared with the guest (virtio-fs, tag `qorral`).
     pub shares: Vec<Share>,
+    pub share_cache: ShareCache,
     /// Extra QEMU arguments for power users, appended last.
     pub extra_args: Vec<String>,
     /// Disk image outside the machine folder (adopted machines). Default:
@@ -195,6 +222,7 @@ impl Default for VmConfig {
             network: NetworkMode::Nat,
             port_forwards: Vec::new(),
             shares: Vec::new(),
+            share_cache: ShareCache::Auto,
             extra_args: Vec::new(),
             disk_path: None,
             efivars_path: None,
