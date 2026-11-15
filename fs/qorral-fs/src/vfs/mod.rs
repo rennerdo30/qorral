@@ -51,6 +51,8 @@ struct VirtioFsInner {
     mode: VirtioFsMode,
     /// qorral: guest-side caching (attributes and file data).
     cache: CacheMode,
+    /// qorral: the guest kernel agreed to the writeback cache (auto mode).
+    writeback: std::sync::atomic::AtomicBool,
 }
 
 /// qorral: how much the guest may cache. Entries (names) are never cached:
@@ -132,6 +134,23 @@ pub struct VirtioFs {
 
 impl Fuse for VirtioFs {
     fn init(&self, info: &mut SessionInfo) {
+        // qorral: in auto mode the guest kernel may gather small writes in
+        // its page cache and send them in large batches (FUSE writeback
+        // cache), instead of one round trip per page (sendfile, small
+        // write() calls). See writeback_flags for what the server must do.
+        let writeback = self.inner.cache == CacheMode::Auto && info.capable() & FUSE_WRITEBACK_CACHE != 0;
+        if writeback {
+            info.want |= FUSE_WRITEBACK_CACHE;
+        }
+        self.inner.writeback.store(writeback, std::sync::atomic::Ordering::Relaxed);
+        // qorral: lxutil already clears set-uid/set-gid on write, truncate
+        // and chown (its kill_priv state). Saying so with KILLPRIV_V2 lets
+        // the guest kernel skip a GETXATTR(security.capability) round trip
+        // before every write() (as virtiofsd's killpriv_v2). File
+        // capabilities stored as xattrs are not cleared on write.
+        if info.capable() & FUSE_HANDLE_KILLPRIV_V2 != 0 {
+            info.want |= FUSE_HANDLE_KILLPRIV_V2;
+        }
         // Indicate we support both readdir and readdirplus.
         if info.capable() & FUSE_DO_READDIRPLUS != 0 {
             info.want |= FUSE_DO_READDIRPLUS;
@@ -217,7 +236,20 @@ impl Fuse for VirtioFs {
             if arg.valid & !(FATTR_FH | FATTR_LOCKOWNER) != 0 {
                 self.check_writable(&inode)?;
             }
-            inode.set_attr(arg, request.uid())?
+            match inode.set_attr(arg, request.uid()) {
+                Ok(attr) => attr,
+                // qorral: inodes are keyed by path, so after an open file was
+                // renamed or deleted its path no longer resolves. The kernel
+                // still sends node-based SETATTR (with the writeback cache it
+                // flushes mtime/ctime this way), which then failed with EIO in
+                // the guest. Apply it through an open handle of the same inode.
+                Err(e) if e.value() == lx::ENOENT => {
+                    let Some(file) = self.open_file_of(&inode) else { return Err(e) };
+                    file.set_attr(arg, request.uid())?;
+                    file.get_attr()?
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         Ok(fuse_attr_out::new(self.attr_timeout(), attr))
@@ -247,7 +279,7 @@ impl Fuse for VirtioFs {
     }
 
     fn open(&self, request: &Request, flags: u32) -> lx::Result<fuse_open_out> {
-        let options = util::open_flags(flags)?;
+        let options = util::open_flags(self.writeback_flags(flags))?;
         let inode = self.get_inode(request.node_id())?;
         self.check_open_readonly(&inode, options)?;
         let reservation = self.reserve_file()?;
@@ -259,7 +291,7 @@ impl Fuse for VirtioFs {
     }
 
     fn create(&self, request: &Request, name: &lx::LxStr, arg: &fuse_create_in) -> lx::Result<CreateOut> {
-        let options = util::create_flags(arg.flags)?;
+        let options = util::create_flags(self.writeback_flags(arg.flags))?;
         if self.is_synthetic_root(request.node_id()) {
             return Err(lx::Error::EROFS);
         }
@@ -599,6 +631,7 @@ impl VirtioFs {
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Direct,
                 cache: CacheMode::Strict,
+                writeback: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
@@ -617,6 +650,7 @@ impl VirtioFs {
                 files: RwLock::new(HandleMap::new()),
                 mode: VirtioFsMode::Aggregate(AggregateState::new()),
                 cache: CacheMode::Strict,
+                writeback: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -653,6 +687,21 @@ impl VirtioFs {
             CacheMode::Strict => ATTRIBUTE_TIMEOUT,
             CacheMode::Auto => AUTO_ATTRIBUTE_TIMEOUT,
         }
+    }
+
+    /// qorral: with the writeback cache the kernel reads pages of files the
+    /// guest opened write-only and keeps the append position itself, so the
+    /// host file is opened read-write and without O_APPEND (as virtiofsd).
+    fn writeback_flags(&self, flags: u32) -> u32 {
+        if !self.inner.writeback.load(std::sync::atomic::Ordering::Relaxed) {
+            return flags;
+        }
+        let (wronly, rdwr, append) = (lx::O_WRONLY as u32, lx::O_RDWR as u32, lx::O_APPEND as u32);
+        let mut f = flags;
+        if f & 3 == wronly {
+            f = (f & !3) | rdwr;
+        }
+        f & !append
     }
 
     /// qorral: open flags for the cache mode.
@@ -711,6 +760,12 @@ impl VirtioFs {
     fn reserve_inode(&self) -> lx::Result<InodeReservation<'_>> {
         let reservation = self.inner.inodes.write().reserve().ok_or(lx::Error::ENOSPC)?;
         Ok(InodeReservation { inodes: &self.inner.inodes, reservation, committed: false })
+    }
+
+    /// qorral: any open handle of `inode` (same inode object, not path).
+    fn open_file_of(&self, inode: &Arc<VirtioFsInode>) -> Option<Arc<VirtioFsFile>> {
+        let files = self.inner.files.read();
+        files.values.values().find(|f| std::ptr::eq(f.inode(), Arc::as_ptr(inode))).cloned()
     }
 
     /// Retrieve the file object with the specified file handle.
