@@ -10,6 +10,7 @@
 
 mod aggregate;
 mod file;
+mod host_name;
 mod inode;
 #[cfg(test)]
 mod test_helpers;
@@ -111,6 +112,13 @@ fn build_volume(
     let options = mount_options.cloned().unwrap_or_default();
     let volume = options.new_volume(root_path)?;
     Ok((volume, readonly))
+}
+
+/// qorral: refuses to create `name` when the host folder already holds an
+/// entry whose name differs only in case: on a case-insensitive host the
+/// create would open (and could truncate) that other file.
+fn check_no_case_twin(parent: &VirtioFsInode, name: &lx::LxStr) -> lx::Result<()> {
+    if parent.case_mismatch(name) { Err(lx::Error::EEXIST) } else { Ok(()) }
 }
 
 /// Implementation of the virtio-fs file system.
@@ -257,6 +265,7 @@ impl Fuse for VirtioFs {
         }
         let inode = self.get_inode(request.node_id())?;
         self.check_writable(&inode)?;
+        check_no_case_twin(&inode, name)?;
         let inode_reservation = self.reserve_inode()?;
         let file_reservation = self.reserve_file()?;
         let (new_inode, attr, file) = inode.create(name, options, arg.mode, request.uid(), request.gid())?;
@@ -279,6 +288,7 @@ impl Fuse for VirtioFs {
         }
         let inode = self.get_inode(request.node_id())?;
         self.check_writable(&inode)?;
+        check_no_case_twin(&inode, name)?;
         let reservation = self.reserve_inode()?;
         let (new_inode, attr) = inode.mkdir(name, arg.mode, request.uid(), request.gid())?;
         let (_, node_id) = reservation.insert(new_inode)?;
@@ -291,6 +301,7 @@ impl Fuse for VirtioFs {
         }
         let inode = self.get_inode(request.node_id())?;
         self.check_writable(&inode)?;
+        check_no_case_twin(&inode, name)?;
         let reservation = self.reserve_inode()?;
         let (new_inode, attr) = inode.mknod(name, arg.mode, request.uid(), request.gid(), arg.rdev)?;
 
@@ -304,6 +315,7 @@ impl Fuse for VirtioFs {
         }
         let inode = self.get_inode(request.node_id())?;
         self.check_writable(&inode)?;
+        check_no_case_twin(&inode, name)?;
         let reservation = self.reserve_inode()?;
         let (new_inode, attr) = inode.symlink(name, target, request.uid(), request.gid())?;
 
@@ -318,6 +330,7 @@ impl Fuse for VirtioFs {
         let inode = self.get_inode(request.node_id())?;
         let target_inode = self.get_inode(target)?;
         self.check_writable(&inode)?;
+        check_no_case_twin(&inode, name)?;
         let attr = inode.link(name, &target_inode)?;
 
         // Increment the lookup count since we're returning an entry for this inode.
@@ -412,6 +425,14 @@ impl Fuse for VirtioFs {
             return Err(lx::Error::EXDEV);
         }
         self.check_writable(&inode)?;
+        // qorral: renaming onto a name that only differs in case from another
+        // entry would replace it; a case-only rename of the same entry is fine.
+        let same_entry = request.node_id() == new_dir
+            && String::from_utf8_lossy(name.as_bytes()).to_lowercase()
+                == String::from_utf8_lossy(new_name.as_bytes()).to_lowercase();
+        if !same_entry {
+            check_no_case_twin(&new_inode, new_name)?;
+        }
         inode.rename(name, &new_inode, new_name, flags)?;
         // A rename doesn't preserve inode identity on path-keyed volumes, so
         // evict both the vacated source path and the overwritten destination
@@ -564,9 +585,10 @@ impl VirtioFs {
 
     /// Create a new virtio-fs for the specified root path.
     pub fn new(root_path: impl AsRef<Path>, mount_options: Option<&LxVolumeOptions>) -> Result<Self, CreateError> {
-        let (volume, readonly) = build_volume(root_path, mount_options)?;
+        let root = root_path.as_ref().to_path_buf();
+        let (volume, readonly) = build_volume(&root, mount_options)?;
         let mut inodes = InodeMap::new(false);
-        let volume = Arc::new(VirtioFsVolume::new(volume, 0, readonly));
+        let volume = Arc::new(VirtioFsVolume::new(volume, 0, readonly).with_host_root(&root));
         let (root_inode, _) = VirtioFsInode::new(volume, PathBuf::new())?;
         if inodes.insert(root_inode)?.1 != FUSE_ROOT_ID {
             return Err(lx::Error::EINVAL.into());
@@ -644,6 +666,10 @@ impl VirtioFs {
 
     fn lookup_helper(&self, inode: &VirtioFsInode, name: &lx::LxStr) -> lx::Result<fuse_entry_out> {
         let (new_inode, attr) = inode.lookup_child(name)?;
+        // qorral: "readme" must not find "Readme" (see case_mismatch).
+        if inode.case_mismatch(name) {
+            return Err(lx::Error::ENOENT);
+        }
         let (_, new_inode_nr) = self.insert_inode(new_inode)?;
         Ok(fuse_entry_out::new(new_inode_nr, ENTRY_TIMEOUT, self.attr_timeout(), attr))
     }

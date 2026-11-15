@@ -37,7 +37,8 @@ usage: qorral [command] [options]      (no command: open the app)
   keys <vm> <combo>...                  press keys, e.g. ctrl-alt-delete ret
   exec <vm> [--timeout S] [--wait-agent S] -- <program> [args]...
                                         run a program in the guest (QEMU guest agent; runs as
-                                        SYSTEM/root); a non-zero guest exit code exits 1
+                                        SYSTEM/root); a non-zero guest exit code exits 1.
+                                        Git Bash rewrites /paths after --: set MSYS_NO_PATHCONV=1
   delete <vm> --yes                     delete a stopped machine and its disk
   share add <vm> <folder> [--name N] [--readonly]
                                         share a host folder (guest: mount -t virtiofs qorral DIR)

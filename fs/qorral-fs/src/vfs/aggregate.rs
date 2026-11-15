@@ -114,7 +114,8 @@ impl VirtioFs {
             aggregate.registry.read().check_can_add()?;
         }
 
-        let (volume, readonly) = build_volume(root_path, mount_options)?;
+        let root = root_path.as_ref().to_path_buf();
+        let (volume, readonly) = build_volume(&root, mount_options)?;
 
         let mut registry = aggregate.registry.write();
         registry.check_can_add()?;
@@ -126,7 +127,7 @@ impl VirtioFs {
         registry.next_volume_id = volume_id.checked_add(1).ok_or(lx::Error::ENOSPC)?;
         registry.entries.push(ChildEntry {
             name: name.to_string(),
-            volume: Arc::new(VirtioFsVolume::new(volume, volume_id, readonly)),
+            volume: Arc::new(VirtioFsVolume::new(volume, volume_id, readonly).with_host_root(&root)),
         });
         tracing::info!(name, volume_id, child_count = registry.entries.len(), "added aggregate virtio-fs child");
         Ok(())

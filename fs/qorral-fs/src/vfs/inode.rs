@@ -42,12 +42,20 @@ pub(crate) struct VirtioFsVolume {
     id: u32,
     readonly: bool,
     stable_file_ids: bool,
+    /// qorral: the host folder, for the exact-case name check.
+    host_root: Option<PathBuf>,
 }
 
 impl VirtioFsVolume {
     pub(crate) fn new(volume: LxVolume, id: u32, readonly: bool) -> Self {
         let stable_file_ids = volume.supports_stable_file_id();
-        Self { volume: Arc::new(volume), id, readonly, stable_file_ids }
+        Self { volume: Arc::new(volume), id, readonly, stable_file_ids, host_root: None }
+    }
+
+    /// qorral: remembers the host folder (enables the exact-case check).
+    pub(crate) fn with_host_root(mut self, root: impl AsRef<std::path::Path>) -> Self {
+        self.host_root = std::path::absolute(root.as_ref()).ok();
+        self
     }
 
     pub(crate) fn id(&self) -> u32 {
@@ -407,6 +415,19 @@ impl VirtioFsInode {
         }
         let path = self.child_path(name).ok()?;
         Some(DedupKey::Path(self.volume_id(), path))
+    }
+
+    /// qorral: true when `name` reaches a host entry whose real name differs
+    /// only in case (a case-insensitive host folder). Linux treats those as
+    /// different names, so the server must neither return that entry for
+    /// `name` nor create `name` over it (that silently overwrote files).
+    /// Names the host stores with remapped characters never count.
+    pub(crate) fn case_mismatch(&self, name: &LxStr) -> bool {
+        let Some(root) = &self.volume.host_root else { return false };
+        let Ok(rel) = self.child_path(name) else { return false };
+        let Some(actual) = crate::vfs::host_name::actual_name(&root.join(rel)) else { return false };
+        let requested = String::from_utf8_lossy(name.as_bytes());
+        actual != requested && actual.to_lowercase() == requested.to_lowercase()
     }
 
     /// Appends a child name to this inode's path.
