@@ -1,0 +1,7 @@
+# The DLL ships next to QEMU on machines that may lack the MSVC runtime:
+# link it statically so qorral_fs.dll depends on Windows system DLLs only.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
