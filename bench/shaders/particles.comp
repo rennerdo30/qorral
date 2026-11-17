@@ -1,0 +1,16 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "particles_common.glsl"
+
+// Particle simulation in a compute shader, one invocation per particle.
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer Particles { Particle p[]; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= pc.count) return;
+    p[id] = simulate(id, p[id]);
+}
