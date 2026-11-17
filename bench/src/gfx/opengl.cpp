@@ -11,6 +11,7 @@
 #include <SDL_opengl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -113,6 +114,11 @@ public:
         return out;
     }
     bool canCapture() const override { return true; }
+    double waitPresented(std::string& source) override {
+        gl.Finish();  // after the swap: the frame and the swap have reached the GPU
+        source = "gpu";
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart_).count();
+    }
 
     Buffer createBuffer(BufferKind kind, size_t size, const void* data) override;
     void updateBuffer(Buffer b, const void* data, size_t size) override;
@@ -182,6 +188,7 @@ private:
 
     uint32_t slot_ = 0;
     uint64_t frameCounter_ = 0;
+    std::chrono::steady_clock::time_point frameStart_{};
     GLsync fences_[kFramesInFlight]{};
     GLuint queries_[kFramesInFlight][2]{};
     bool slotPending_[kFramesInFlight]{};
@@ -385,6 +392,7 @@ void GlDevice::collectTimestamps(uint32_t slot) {
 }
 
 bool GlDevice::beginFrame(bool measured) {
+    frameStart_ = std::chrono::steady_clock::now();
     slot_ = static_cast<uint32_t>(frameCounter_ % kFramesInFlight);
     if (fences_[slot_]) {
         GLenum r = gl.ClientWaitSync(fences_[slot_], GL_SYNC_FLUSH_COMMANDS_BIT, kFenceTimeoutNs);

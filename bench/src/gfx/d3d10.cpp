@@ -81,6 +81,7 @@ public:
         return out;
     }
     bool canCapture() const override { return true; }
+    double waitPresented(std::string& source) override;
 
     Buffer createBuffer(BufferKind kind, size_t size, const void* data) override;
     void updateBuffer(Buffer b, const void* data, size_t size) override;
@@ -148,6 +149,8 @@ private:
 
     uint32_t slot_ = 0;
     uint64_t frameCounter_ = 0;
+    LONGLONG frameStartQpc_ = 0;
+    int statsFailures_ = 0;  // frame statistics unavailable after 3 failures in a row
     Com<ID3D10Query> disjoint_[kFramesInFlight], tsBegin_[kFramesInFlight], tsEnd_[kFramesInFlight], done_[kFramesInFlight];
     bool slotPending_[kFramesInFlight]{};
     bool slotMeasured_[kFramesInFlight]{};
@@ -325,6 +328,7 @@ void D3D10Device::collectTimestamps(uint32_t slot) {
 }
 
 bool D3D10Device::beginFrame(bool measured) {
+    frameStartQpc_ = d3d::qpcNow();
     slot_ = static_cast<uint32_t>(frameCounter_ % kFramesInFlight);
     if (frameCounter_ >= kFramesInFlight) {
         BOOL done = FALSE;
@@ -369,6 +373,21 @@ bool D3D10Device::endFrame(const std::string* capturePath) {
         d3d::failHr("IDXGISwapChain::Present (device removed)", dev_->GetDeviceRemovedReason(), __FILE__, __LINE__);
     if (FAILED(hr)) d3d::failHr("IDXGISwapChain::Present", hr, __FILE__, __LINE__);
     return false;
+}
+
+double D3D10Device::waitPresented(std::string& source) {
+    double ms = 0.0;
+    if (!opt_.offscreen && statsFailures_ < 3) {
+        if (d3d::waitDxgiDisplayed(swap_.get(), frameStartQpc_, ms)) {
+            statsFailures_ = 0;
+            source = "display";
+            return ms;
+        }
+        ++statsFailures_;
+    }
+    waitIdle();
+    source = "gpu";
+    return d3d::qpcMs(frameStartQpc_, d3d::qpcNow());
 }
 
 void D3D10Device::finishFrames() {

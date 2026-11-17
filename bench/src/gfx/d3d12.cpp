@@ -84,6 +84,7 @@ public:
         return out;
     }
     bool canCapture() const override { return true; }
+    double waitPresented(std::string& source) override;
 
     Buffer createBuffer(BufferKind kind, size_t size, const void* data) override;
     void updateBuffer(Buffer b, const void* data, size_t size) override;
@@ -170,6 +171,8 @@ private:
 
     uint32_t slot_ = 0;
     uint64_t frameCounter_ = 0;
+    LONGLONG frameStartQpc_ = 0;
+    int statsFailures_ = 0;  // frame statistics unavailable after 3 failures in a row
     std::vector<BufferRec> buffers_;
     std::vector<TextureRec> textures_;
     std::vector<PipelineRec> pipelines_;
@@ -443,6 +446,7 @@ void D3D12Device::collectTimestamps(uint32_t slot) {
 }
 
 bool D3D12Device::beginFrame(bool measured) {
+    frameStartQpc_ = d3d::qpcNow();
     slot_ = static_cast<uint32_t>(frameCounter_ % kFramesInFlight);
     if (fence_->GetCompletedValue() < slotFence_[slot_]) {
         HR_CHECK(fence_->SetEventOnCompletion(slotFence_[slot_], fenceEvent_));
@@ -508,6 +512,21 @@ bool D3D12Device::endFrame(const std::string* capturePath) {
         capture_.reset();
     }
     return false;
+}
+
+double D3D12Device::waitPresented(std::string& source) {
+    double ms = 0.0;
+    if (!opt_.offscreen && statsFailures_ < 3) {
+        if (d3d::waitDxgiDisplayed(swap_.get(), frameStartQpc_, ms)) {
+            statsFailures_ = 0;
+            source = "display";
+            return ms;
+        }
+        ++statsFailures_;
+    }
+    signalAndWait();
+    source = "gpu";
+    return d3d::qpcMs(frameStartQpc_, d3d::qpcNow());
 }
 
 void D3D12Device::finishFrames() {

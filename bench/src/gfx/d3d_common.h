@@ -72,4 +72,10 @@ bool tearingSupported(IDXGIFactory1* factory);
 
 const char* dxgiFormatName(DXGI_FORMAT f);
 
+LONGLONG qpcNow();
+double qpcMs(LONGLONG from, LONGLONG to);
+// Waits (at most 250 ms) until DXGI's frame statistics report the last Present as displayed and
+// returns the ms from `startQpc` to its display time. False when the statistics are not available.
+bool waitDxgiDisplayed(IDXGISwapChain* sc, LONGLONG startQpc, double& ms);
+
 }  // namespace gfx::d3d

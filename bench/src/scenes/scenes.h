@@ -8,9 +8,10 @@
 #include <string>
 
 struct FrameInfo {
-    uint32_t slot;  // frame-in-flight index, 0..kFramesInFlight-1
-    double time;    // seconds since scene start (drives all animation)
-    float dt;       // seconds since the previous frame
+    uint32_t slot;    // frame-in-flight index, 0..kFramesInFlight-1
+    double time;      // seconds since scene start (drives all animation)
+    float dt;         // seconds since the previous frame
+    uint32_t inputs;  // key and mouse-button presses since the scene started
 };
 
 class Scene {
@@ -22,6 +23,8 @@ public:
     // Resources that depend on the backbuffer size (render targets).
     virtual void createSized(gfx::Device& dev) = 0;
     virtual void record(gfx::Device& dev, const FrameInfo& fi) = 0;
+    // Closed loop: one frame at a time, each waited for until displayed (latency measurement).
+    virtual bool closedLoop() const { return false; }
     void destroySized() { sized.flush(); }
     void destroy() {
         sized.flush();
@@ -37,6 +40,7 @@ std::unique_ptr<Scene> makeRaymarchScene();
 std::unique_ptr<Scene> makeInstancedScene();
 std::unique_ptr<Scene> makeParticlesScene();
 std::unique_ptr<Scene> makePostfxScene(bool fxaa);
+std::unique_ptr<Scene> makeLatencyScene();
 
 // Registers a handle's destruction in a resource list.
 template <typename H>

@@ -216,6 +216,7 @@ public:
         return out;
     }
     bool canCapture() const override { return true; }
+    double waitPresented(std::string& source) override;
 
     Buffer createBuffer(BufferKind kind, size_t size, const void* data) override;
     void updateBuffer(Buffer b, const void* data, size_t size) override;
@@ -272,6 +273,8 @@ private:
 
     uint32_t slot_ = 0;
     uint64_t frameCounter_ = 0;
+    LONGLONG frameStartQpc_ = 0;
+    int statsFailures_ = 0;
     Com<IDirect3DQuery9> disjoint_[kFramesInFlight], freq_[kFramesInFlight], tsBegin_[kFramesInFlight],
         tsEnd_[kFramesInFlight], done_[kFramesInFlight];
     bool slotPending_[kFramesInFlight]{};
@@ -417,6 +420,7 @@ void D3D9Device::collectTimestamps(uint32_t slot) {
 }
 
 bool D3D9Device::beginFrame(bool measured) {
+    frameStartQpc_ = d3d::qpcNow();
     slot_ = static_cast<uint32_t>(frameCounter_ % kFramesInFlight);
     if (frameCounter_ >= kFramesInFlight) {
         BOOL done = FALSE;
@@ -461,6 +465,36 @@ bool D3D9Device::endFrame(const std::string* capturePath) {
         d3d::failHr("IDirect3DDevice9Ex::PresentEx (device lost)", hr, __FILE__, __LINE__);
     if (FAILED(hr)) d3d::failHr("IDirect3DDevice9Ex::PresentEx", hr, __FILE__, __LINE__);
     return false;
+}
+
+double D3D9Device::waitPresented(std::string& source) {
+    if (!opt_.offscreen && statsFailures_ < 3) {
+        Com<IDirect3DSwapChain9> sc;
+        Com<IDirect3DSwapChain9Ex> sc9ex;
+        if (SUCCEEDED(dev_->GetSwapChain(0, sc.put()))) sc9ex = sc.as<IDirect3DSwapChain9Ex>();
+        UINT last = 0;
+        if (sc9ex && SUCCEEDED(sc9ex->GetLastPresentCount(&last))) {
+            const LONGLONG t0 = d3d::qpcNow();
+            for (;;) {
+                D3DPRESENTSTATS st{};
+                HRESULT hr = sc9ex->GetPresentStats(&st);
+                if (SUCCEEDED(hr) && st.PresentCount >= last) {
+                    if (st.PresentCount == last) {
+                        statsFailures_ = 0;
+                        source = "display";
+                        return d3d::qpcMs(frameStartQpc_, st.SyncQPCTime.QuadPart);
+                    }
+                    break;
+                }
+                if (FAILED(hr) || d3d::qpcMs(t0, d3d::qpcNow()) > 250.0) break;
+                SwitchToThread();
+            }
+        }
+        ++statsFailures_;
+    }
+    waitIdle();
+    source = "gpu";
+    return d3d::qpcMs(frameStartQpc_, d3d::qpcNow());
 }
 
 void D3D9Device::finishFrames() {

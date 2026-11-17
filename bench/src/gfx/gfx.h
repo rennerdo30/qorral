@@ -161,6 +161,11 @@ public:
     virtual void finishFrames() = 0;                    // waits for the GPU, collects pending timings
     virtual std::vector<double> takeGpuTimes() = 0;     // GPU ms of measured frames since the last call
     virtual bool canCapture() const = 0;
+    // Latency scene (one frame at a time): after endFrame, waits until that frame is displayed and
+    // returns the ms since its beginFrame. `source` is "display" (the API reported the frame's
+    // display time: DXGI and D3D9Ex frame statistics, Vulkan present wait) or "gpu" (the API cannot
+    // tell; this is the time until the GPU finished the frame).
+    virtual double waitPresented(std::string& source) = 0;
 
     // Resources (destroy only when the GPU is idle: after waitIdle or finishFrames)
     virtual Buffer createBuffer(BufferKind kind, size_t size, const void* data) = 0;

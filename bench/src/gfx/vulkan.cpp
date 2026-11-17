@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -258,6 +259,7 @@ public:
         return out;
     }
     bool canCapture() const override { return canCapture_; }
+    double waitPresented(std::string& source) override;
 
     Buffer createBuffer(BufferKind kind, size_t size, const void* data) override;
     void updateBuffer(Buffer b, const void* data, size_t size) override;
@@ -344,7 +346,12 @@ private:
     VkFence fences_[kFramesInFlight]{};
     VkSemaphore imageAvailable_[kFramesInFlight]{};
     uint32_t slot_ = 0;
+    uint32_t lastSlot_ = 0;
     uint32_t imageIndex_ = 0;
+    std::chrono::steady_clock::time_point frameStart_{};
+    bool presentWait_ = false;  // VK_KHR_present_id + VK_KHR_present_wait enabled
+    uint64_t presentId_ = 0;
+    PFN_vkWaitForPresentKHR waitForPresent_ = nullptr;
     bool recreateAfterFrame_ = false;
     uint64_t frameCounter_ = 0;
     VkQueryPool queryPool_ = VK_NULL_HANDLE;
@@ -571,15 +578,46 @@ void VulkanDevice::createDevice() {
     qci.queueFamilyIndex = queueFamily_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char* exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> exts;
+    if (!opt_.offscreen) exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    // Present wait (latency scene): optional, only when the driver has both extensions and features.
+    VkPhysicalDevicePresentIdFeaturesKHR idFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
+    VkPhysicalDevicePresentWaitFeaturesKHR waitFeat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
+    if (!opt_.offscreen) {
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> avail(n);
+        vkEnumerateDeviceExtensionProperties(physical_, nullptr, &n, avail.data());
+        auto has = [&](const char* e) {
+            return std::any_of(avail.begin(), avail.end(), [&](const VkExtensionProperties& p) { return std::strcmp(p.extensionName, e) == 0; });
+        };
+        if (has(VK_KHR_PRESENT_ID_EXTENSION_NAME) && has(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+            idFeat.pNext = &waitFeat;
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &idFeat;
+            vkGetPhysicalDeviceFeatures2(physical_, &f2);
+            if (idFeat.presentId && waitFeat.presentWait) {
+                presentWait_ = true;
+                exts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+                exts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+            }
+        }
+    }
+    idFeat.pNext = &waitFeat;
+    waitFeat.pNext = nullptr;
     VkPhysicalDeviceFeatures features{};
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    ci.pNext = presentWait_ ? &idFeat : nullptr;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
-    ci.enabledExtensionCount = opt_.offscreen ? 0 : 1;
-    ci.ppEnabledExtensionNames = exts;
+    ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    ci.ppEnabledExtensionNames = exts.data();
     ci.pEnabledFeatures = &features;
     VK_CHECK(vkCreateDevice(physical_, &ci, nullptr, &device_));
+    if (presentWait_) {
+        waitForPresent_ = reinterpret_cast<PFN_vkWaitForPresentKHR>(vkGetDeviceProcAddr(device_, "vkWaitForPresentKHR"));
+        presentWait_ = waitForPresent_ != nullptr;
+    }
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
 
     uint32_t nq = 0;
@@ -812,6 +850,7 @@ void VulkanDevice::collectTimestamps(uint32_t slot) {
 }
 
 bool VulkanDevice::beginFrame(bool measured) {
+    frameStart_ = std::chrono::steady_clock::now();
     slot_ = static_cast<uint32_t>(frameCounter_ % kFramesInFlight);
     VkResult r = vkWaitForFences(device_, 1, &fences_[slot_], VK_TRUE, kTimeoutNs);
     if (r == VK_TIMEOUT) fail("vkWaitForFences (GPU did not finish a frame within 10 s)", r, __FILE__, __LINE__);
@@ -896,6 +935,7 @@ bool VulkanDevice::endFrame(const std::string* capturePath) {
     si.pCommandBuffers = &cmd;
     VK_CHECK(vkQueueSubmit(queue_, 1, &si, fences_[slot_]));
     slotPending_[slot_] = info_.timestamps;
+    lastSlot_ = slot_;
     ++frameCounter_;
 
     VkResult r = VK_SUCCESS;
@@ -906,6 +946,13 @@ bool VulkanDevice::endFrame(const std::string* capturePath) {
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &imageIndex_;
+        VkPresentIdKHR pid{VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+        const uint64_t id = ++presentId_;
+        if (presentWait_) {
+            pid.swapchainCount = 1;
+            pid.pPresentIds = &id;
+            pi.pNext = &pid;
+        }
         r = vkQueuePresentKHR(queue_, &pi);
     }
     if (capture) {
@@ -920,6 +967,20 @@ bool VulkanDevice::endFrame(const std::string* capturePath) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) return true;
     if (r != VK_SUCCESS) fail("vkQueuePresentKHR", r, __FILE__, __LINE__);
     return recreateAfterFrame_;
+}
+
+double VulkanDevice::waitPresented(std::string& source) {
+    using clock = std::chrono::steady_clock;
+    if (presentWait_) {
+        VkResult r = waitForPresent_(device_, swapchain_, presentId_, 250ull * 1000 * 1000);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            source = "display";
+            return std::chrono::duration<double, std::milli>(clock::now() - frameStart_).count();
+        }
+    }
+    VK_CHECK(vkWaitForFences(device_, 1, &fences_[lastSlot_], VK_TRUE, kTimeoutNs));
+    source = "gpu";
+    return std::chrono::duration<double, std::milli>(clock::now() - frameStart_).count();
 }
 
 void VulkanDevice::finishFrames() {

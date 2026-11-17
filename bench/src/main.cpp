@@ -31,6 +31,7 @@ namespace {
 enum ExitCode { kExitOk = 0, kExitUsage = 1, kExitRuntime = 2, kExitAborted = 3, kExitValidation = 4 };
 
 const char* const kAllScenes[] = {"raymarch", "instanced", "particles", "postfx"};
+const char* const kExtraScenes[] = {"latency"};  // only on request, not part of "all" or the score
 
 struct Options {
     std::vector<gfx::Api> apis;
@@ -57,6 +58,10 @@ struct SceneResult {
     double avgFps = 0, avgMs = 0, medianMs = 0, p99Ms = 0, p999Ms = 0, low1Fps = 0;
     double gpuMedianMs = -1;  // < 0: not available
     size_t gpuSamples = 0;
+    // Closed-loop scenes: frame start to displayed (or GPU done), see Device::waitPresented.
+    size_t latencySamples = 0;
+    double latencyMedianMs = 0, latencyP99Ms = 0, latencyMinMs = 0, latencyMaxMs = 0;
+    std::string latencySource;
 };
 
 struct ApiRun {
@@ -81,7 +86,9 @@ void usage() {
         "qorral-bench %s - GPU benchmark: the same scenes in every graphics API\n\n"
         "Usage: qorral-bench [options]\n"
         "  --api NAME|all       %s, a comma list, or all (default vulkan)\n"
-        "  --scene NAME|all     raymarch, instanced, particles, postfx, a comma list, or all (default all)\n"
+        "  --scene NAME|all     raymarch, instanced, particles, postfx, a comma list, or all (default all);\n"
+        "                       latency: black, white for 250 ms after each key or click, one frame at a\n"
+        "                       time; reports the in-guest frame latency (for qorral latency <vm>)\n"
         "  --seconds N          measured seconds per scene (default 10)\n"
         "  --warmup S           warmup seconds per scene, excluded from stats (default 2)\n"
         "  --width W --height H window size (default 1280x720)\n"
@@ -202,8 +209,10 @@ bool parseArgs(int argc, char** argv, Options& o, bool& helpOnly) {
         o.scenes.assign(std::begin(kAllScenes), std::end(kAllScenes));
     } else {
         for (const std::string& item : splitComma(sceneArg)) {
-            if (std::find(std::begin(kAllScenes), std::end(kAllScenes), item) == std::end(kAllScenes)) {
-                std::fprintf(stderr, "error: unknown scene '%s' (raymarch, instanced, particles, postfx, all)\n", item.c_str());
+            if (std::find(std::begin(kAllScenes), std::end(kAllScenes), item) == std::end(kAllScenes) &&
+                std::find(std::begin(kExtraScenes), std::end(kExtraScenes), item) == std::end(kExtraScenes)) {
+                std::fprintf(stderr, "error: unknown scene '%s' (raymarch, instanced, particles, postfx, latency, all)\n",
+                             item.c_str());
                 return false;
             }
             o.scenes.push_back(item);
@@ -217,6 +226,7 @@ std::unique_ptr<Scene> makeScene(const std::string& name, const Options& o) {
     if (name == "raymarch") return makeRaymarchScene();
     if (name == "instanced") return makeInstancedScene();
     if (name == "particles") return makeParticlesScene();
+    if (name == "latency") return makeLatencyScene();
     return makePostfxScene(o.fxaa);
 }
 
@@ -257,6 +267,17 @@ double percentile(const std::vector<double>& sorted, double q) {
     size_t rank = static_cast<size_t>(std::ceil(q * sorted.size()));
     rank = std::clamp<size_t>(rank, 1, sorted.size());
     return sorted[rank - 1];
+}
+
+void latencyStats(SceneResult& r, std::vector<double> ms, const std::string& source) {
+    r.latencySamples = ms.size();
+    r.latencySource = source;
+    if (ms.empty()) return;
+    std::sort(ms.begin(), ms.end());
+    r.latencyMedianMs = percentile(ms, 0.5);
+    r.latencyP99Ms = percentile(ms, 0.99);
+    r.latencyMinMs = ms.front();
+    r.latencyMaxMs = ms.back();
 }
 
 SceneResult computeStats(const std::string& name, std::vector<double> frameMs, std::vector<double> gpuMs) {
@@ -305,12 +326,24 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
     size_t titleFrames = 0;
     bool needRecreate = false, aborted = false;
     const std::string api = gfx::apiName(dev.api());
+    uint32_t inputs = 0;
+    std::vector<double> latencyMs;
+    std::string latencySource;
 
     auto seconds = [](clock::duration d) { return std::chrono::duration<double>(d).count(); };
     auto frame = [&](double t, float dt, bool measured, const std::string* capture) {
         if (!dev.beginFrame(measured)) return true;
-        scene->record(dev, FrameInfo{dev.frameSlot(), t, dt});
-        return dev.endFrame(capture);
+        scene->record(dev, FrameInfo{dev.frameSlot(), t, dt, inputs});
+        const bool recreate = dev.endFrame(capture);
+        if (scene->closedLoop()) {
+            std::string source;
+            const double ms = dev.waitPresented(source);
+            if (measured) {
+                latencyMs.push_back(ms);
+                latencySource = source;
+            }
+        }
+        return recreate;
     };
 
     while (!aborted) {
@@ -318,6 +351,7 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) aborted = true;
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) aborted = true;
+            else if ((ev.type == SDL_KEYDOWN && !ev.key.repeat) || ev.type == SDL_MOUSEBUTTONDOWN) ++inputs;
             if (ev.type == SDL_WINDOWEVENT && (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                                                ev.window.event == SDL_WINDOWEVENT_RESIZED))
                 needRecreate = !o.offscreen;
@@ -379,6 +413,7 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
     dev.finishFrames();
     scene->destroy();
     result = computeStats(sceneName, std::move(frameMs), dev.takeGpuTimes());
+    latencyStats(result, std::move(latencyMs), latencySource);
     return !aborted;
 }
 
@@ -469,7 +504,13 @@ std::string runJson(const ApiRun& run, const Options& o, const std::string& os, 
         j << ind << "    \"p999_ms\": " << num(r.p999Ms) << ",\n";
         j << ind << "    \"low_1pct_fps\": " << num(r.low1Fps, 2) << ",\n";
         j << ind << "    \"gpu_median_ms\": " << (r.gpuMedianMs >= 0 ? num(r.gpuMedianMs) : std::string("null")) << ",\n";
-        j << ind << "    \"gpu_samples\": " << r.gpuSamples << "\n";
+        j << ind << "    \"gpu_samples\": " << r.gpuSamples;
+        if (r.latencySamples) {
+            j << ",\n" << ind << "    \"latency_ms\": { \"source\": \"" << r.latencySource << "\", \"samples\": "
+              << r.latencySamples << ", \"median\": " << num(r.latencyMedianMs) << ", \"p99\": " << num(r.latencyP99Ms)
+              << ", \"min\": " << num(r.latencyMinMs) << ", \"max\": " << num(r.latencyMaxMs) << " }";
+        }
+        j << "\n";
         j << ind << "  }" << (i + 1 < run.results.size() ? "," : "") << "\n";
     }
     j << ind << "],\n";
@@ -523,6 +564,11 @@ void printTable(const ApiRun& run) {
                     r.medianMs, r.p99Ms, r.p999Ms, r.low1Fps, gpu.c_str());
     }
     std::printf("%s\n", std::string(91, '-').c_str());
+    for (auto& r : run.results)
+        if (r.latencySamples)
+            std::printf("Latency (%s, frame start to %s): median %.3f ms, p99 %.3f ms, min %.3f, max %.3f (%zu frames)\n",
+                        r.name.c_str(), r.latencySource == "display" ? "displayed" : "GPU done", r.latencyMedianMs,
+                        r.latencyP99Ms, r.latencyMinMs, r.latencyMaxMs, r.latencySamples);
     std::printf("Score (%s): %ld  (10 x geometric mean of average FPS over %zu scene%s)\n", gfx::apiName(run.api),
                 run.score, run.results.size(), run.results.size() == 1 ? "" : "s");
 }

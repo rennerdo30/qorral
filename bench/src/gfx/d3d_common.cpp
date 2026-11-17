@@ -139,6 +139,39 @@ bool tearingSupported(IDXGIFactory1* factory) {
     return SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow, sizeof allow)) && allow;
 }
 
+LONGLONG qpcNow() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+double qpcMs(LONGLONG from, LONGLONG to) {
+    static const double freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart);
+    }();
+    return static_cast<double>(to - from) * 1000.0 / freq;
+}
+
+bool waitDxgiDisplayed(IDXGISwapChain* sc, LONGLONG startQpc, double& ms) {
+    UINT last = 0;
+    if (FAILED(sc->GetLastPresentCount(&last))) return false;
+    const LONGLONG deadline = qpcNow();
+    for (;;) {
+        DXGI_FRAME_STATISTICS st{};
+        HRESULT hr = sc->GetFrameStatistics(&st);
+        if (SUCCEEDED(hr) && st.PresentCount >= last) {
+            if (st.PresentCount != last) return false;  // the frame was replaced before it was shown
+            ms = qpcMs(startQpc, st.SyncQPCTime.QuadPart);
+            return ms >= 0.0;
+        }
+        if (FAILED(hr) && hr != DXGI_ERROR_FRAME_STATISTICS_DISJOINT) return false;
+        if (qpcMs(deadline, qpcNow()) > 250.0) return false;
+        SwitchToThread();
+    }
+}
+
 const char* dxgiFormatName(DXGI_FORMAT f) {
     switch (f) {
         case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";

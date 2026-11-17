@@ -49,10 +49,10 @@ file(MAKE_DIRECTORY ${GEN})
 set(SHADERS
   fullscreen.vert raymarch.frag instanced.vert instanced.frag
   particles.comp particles.vert particles.frag particles_tex.vert particles_sim.frag
-  composite.frag bloom_down.frag bloom_up.frag post_tonemap.frag fxaa.frag)
+  composite.frag bloom_down.frag bloom_up.frag post_tonemap.frag fxaa.frag solid.frag)
 set(SM5_ONLY particles.comp particles.vert)
 set(SM3_AUTO instanced.vert instanced.frag particles.frag composite.frag bloom_down.frag bloom_up.frag
-    post_tonemap.frag fxaa.frag raymarch.frag)
+    post_tonemap.frag fxaa.frag raymarch.frag solid.frag)
 file(GLOB SHADER_INCLUDES ${SHADER_DIR}/*.glsl)
 
 set(EMBED_SPIRV ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake)
@@ -172,6 +172,7 @@ set(SOURCES
   src/scenes/instanced.cpp
   src/scenes/particles.cpp
   src/scenes/postfx.cpp
+  src/scenes/latency.cpp
   ${TABLE_CPP}
   ${SHADER_HEADERS})
 set(DEFS SDL_MAIN_HANDLED QB_VERSION="${PROJECT_VERSION}")
