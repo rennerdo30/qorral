@@ -11,7 +11,7 @@ endif()
 option(QB_VULKAN "Vulkan backend" ON)
 option(QB_OPENGL "OpenGL backend" ON)
 if(WIN32)
-  option(QB_D3D "Direct3D 9/10/11/12 backends" OFF)  # on once the backends land
+  option(QB_D3D "Direct3D 9/10/11/12 backends" ON)
 else()
   set(QB_D3D OFF)
 endif()
@@ -51,6 +51,8 @@ set(SHADERS
   particles.comp particles.vert particles.frag particles_tex.vert particles_sim.frag
   composite.frag bloom_down.frag bloom_up.frag post_tonemap.frag fxaa.frag)
 set(SM5_ONLY particles.comp particles.vert)
+set(SM3_AUTO instanced.vert instanced.frag particles.frag composite.frag bloom_down.frag bloom_up.frag
+    post_tonemap.frag fxaa.frag raymarch.frag)
 file(GLOB SHADER_INCLUDES ${SHADER_DIR}/*.glsl)
 
 set(EMBED_SPIRV ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake)
@@ -122,14 +124,24 @@ foreach(shader ${SHADERS})
   endif()
   add_custom_command(OUTPUT ${outs} ${cmds} DEPENDS ${deps} COMMENT "GLSL/HLSL ${shader}" VERBATIM)
 
-  # Direct3D 9: hand-written shader model 3.0 versions, where the scene needs them.
+  # Direct3D 9, shader model 3.0: hand-written where SM 3.0 lacks a feature the shader uses (vertex
+  # index, texelFetch, integer math), SPIRV-Cross output for the rest.
   set(hlsl3 "nullptr")
   if(EXISTS ${SHADER_DIR}/d3d9/${shader}.hlsl)
     add_custom_command(OUTPUT ${GEN}/${var}_hlsl3.h
       COMMAND ${CMAKE_COMMAND} -DIN=${SHADER_DIR}/d3d9/${shader}.hlsl -DOUT=${GEN}/${var}_hlsl3.h -DVAR=${var}_hlsl3 -P ${EMBED_TEXT}
-      DEPENDS ${SHADER_DIR}/d3d9/${shader}.hlsl ${EMBED_TEXT} COMMENT "SM3 ${shader}" VERBATIM)
-    list(APPEND outs ${GEN}/${var}_hlsl3.h)
+      DEPENDS ${SHADER_DIR}/d3d9/${shader}.hlsl ${EMBED_TEXT} COMMENT "SM3 ${shader} (hand-written)" VERBATIM)
     set(hlsl3 "${var}_hlsl3")
+  elseif(shader IN_LIST SM3_AUTO)
+    add_custom_command(OUTPUT ${GEN}/${var}_hlsl3.h
+      COMMAND ${SPV_CMD}
+      COMMAND ${SPIRV_CROSS_EXECUTABLE} ${GEN}/${shader}.x.spv --hlsl --shader-model 30 ${flip} --output ${GEN}/${shader}.hlsl3
+      COMMAND ${CMAKE_COMMAND} -DIN=${GEN}/${shader}.hlsl3 -DOUT=${GEN}/${var}_hlsl3.h -DVAR=${var}_hlsl3 -P ${EMBED_TEXT}
+      DEPENDS ${deps} COMMENT "SM3 ${shader}" VERBATIM)
+    set(hlsl3 "${var}_hlsl3")
+  endif()
+  if(NOT hlsl3 STREQUAL "nullptr")
+    list(APPEND SHADER_HEADERS ${GEN}/${var}_hlsl3.h)
     string(APPEND TABLE_INCLUDES "#include \"${var}_hlsl3.h\"\n")
   endif()
 

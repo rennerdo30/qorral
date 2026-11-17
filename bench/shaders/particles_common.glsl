@@ -11,8 +11,8 @@ struct Particle {
 layout(push_constant) uniform Push {
     float time;
     float dt;
-    uint count;
-    uint mode;  // 0: initialize, 1: step
+    float count;  // floats, not uints: Direct3D 9 constant registers hold only floats
+    float mode;   // 0: initialize, 1: step
     vec4 attractor[3];  // xyz position, w strength
 } pc;
 
@@ -74,7 +74,7 @@ Particle spawn(uint id, uint salt, bool initial) {
 
 // One simulation step (or the initial spawn) for particle `id`.
 Particle simulate(uint id, Particle q) {
-    if (pc.mode == 0u) return spawn(id, 0u, true);
+    if (pc.mode < 0.5) return spawn(id, 0u, true);
     vec3 pos = q.pos.xyz;
     vec3 vel = q.vel.xyz;
     float dt = pc.dt;

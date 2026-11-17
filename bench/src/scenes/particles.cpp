@@ -19,8 +19,8 @@ constexpr uint32_t kStateSize = 1024;          // texture variant: 1024 x 1024 p
 struct SimPush {
     float time;
     float dt;
-    uint32_t count;
-    uint32_t mode;  // 0 = initialize, 1 = step
+    float count;  // floats: Direct3D 9 constant registers hold only floats
+    float mode;   // 0 = initialize, 1 = step
     float attractor[3][4];
 };
 
@@ -95,8 +95,8 @@ public:
         SimPush sim{};
         sim.time = t;
         sim.dt = std::clamp(fi.dt, 0.0f, 1.0f / 30.0f);
-        sim.count = kParticleCount;
-        sim.mode = initialized_ ? 1u : 0u;
+        sim.count = static_cast<float>(kParticleCount);
+        sim.mode = initialized_ ? 1.0f : 0.0f;
         for (int i = 0; i < 3; ++i) {
             float ph = i * 2.094f;
             sim.attractor[i][0] = 3.2f * std::sin(t * (0.31f + 0.07f * i) + ph);
