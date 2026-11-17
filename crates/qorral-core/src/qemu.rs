@@ -112,7 +112,12 @@ pub fn args(l: &Launch) -> Vec<String> {
     if !vm.shares.is_empty() {
         // QEMU's option syntax doubles commas inside a value.
         let config = l.paths.shares.display().to_string().replace(',', ",,");
-        push(&["-device", &format!("virtio-fs-host-pci,tag={SHARE_TAG},config={config}")]);
+        // One request queue per guest CPU: Linux gives each CPU its own
+        // queue and interrupt, so a request completes on the CPU that
+        // waits for it instead of waking another one. Windows uses the
+        // first queue only.
+        let queues = vm.cpus.clamp(1, MAX_SHARE_QUEUES);
+        push(&["-device", &format!("virtio-fs-host-pci,tag={SHARE_TAG},config={config},num-request-queues={queues}")]);
     }
     push(&["-audiodev", "none,id=snd0"]);
     // A guest-triggered warm reset hangs under WHPX: a guest reboot ends
@@ -152,6 +157,9 @@ pub fn args(l: &Launch) -> Vec<String> {
 
 /// The virtio-fs tag every guest mounts: `mount -t virtiofs qorral /mnt/host`.
 pub const SHARE_TAG: &str = "qorral";
+
+/// Upper bound for the share device's request queues (one per guest CPU).
+const MAX_SHARE_QUEUES: u32 = 16;
 
 /// The `-nic` value for the machine's network mode and forwards.
 pub fn nic_arg(vm: &VmConfig) -> String {
@@ -273,6 +281,7 @@ mod tests {
         let dev = a.iter().find(|x| x.starts_with("virtio-fs-host-pci")).expect("device");
         assert!(dev.starts_with("virtio-fs-host-pci,tag=qorral,config="), "{dev}");
         assert!(dev.contains("a,,b"), "commas doubled: {dev}");
+        assert!(dev.ends_with(&format!(",num-request-queues={}", vm.cpus.clamp(1, 16))), "{dev}");
         assert!(!launch_args(&VmConfig::default(), Display::Headless).iter().any(|x| x.contains("virtio-fs")));
     }
 
