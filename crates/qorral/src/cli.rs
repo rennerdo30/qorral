@@ -35,6 +35,10 @@ usage: qorral [command] [options]      (no command: open the app)
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
   keys <vm> <combo>...                  press keys, e.g. ctrl-alt-delete ret
+  latency <vm> [--samples N] [--key QCODE] [--interval MS]
+                                        input-to-display latency: presses a key and times until
+                                        the guest's screen changes (run `qorral-bench --scene
+                                        latency` in the guest first; it flashes white on a key)
   exec <vm> [--timeout S] [--wait-agent S] -- <program> [args]...
                                         run a program in the guest (QEMU guest agent; runs as
                                         SYSTEM/root); a non-zero guest exit code exits 1.
@@ -98,6 +102,9 @@ const VALUED: &[&str] = &[
     "--network",
     "--profile",
     "--share",
+    "--samples",
+    "--key",
+    "--interval",
 ];
 
 fn parse(args: Vec<String>) -> Result<Opts, String> {
@@ -209,6 +216,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "stop" => stop(&lib, &o),
         "screenshot" => screenshot(&lib, &o),
         "keys" => keys(&lib, &o),
+        "latency" => latency(&lib, &o),
         "exec" => exec(&lib, &o),
         "delete" | "rm" => delete(&lib, &o),
         "host" => host(&lib, &o),
@@ -565,6 +573,68 @@ fn stop(lib: &Library, o: &Opts) -> Result<(), Fail> {
         print_json(json!({ "machine": entry_json(&Library::load_dir(&e.dir)) }));
     } else {
         println!("Stopped {}", e.config.name);
+    }
+    Ok(())
+}
+
+fn latency(lib: &Library, o: &Opts) -> Result<(), Fail> {
+    let e = find(lib, o)?;
+    let number = |name: &str, default: u64, min: u64, max: u64| -> Result<u64, Fail> {
+        match o.val(name) {
+            None => Ok(default),
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (min..=max).contains(n))
+                .ok_or_else(|| Fail::Usage(format!("{name} must be a number from {min} to {max}"))),
+        }
+    };
+    let samples = number("--samples", 20, 1, 1000)?;
+    // The benchmark's latency scene stays white for 250 ms after a key; the next probe must see it dark.
+    let interval = number("--interval", 500, 300, 60_000)?;
+    let key = o.val("--key").unwrap_or("spc");
+    let mut q = connect(&e)?;
+    let mut ms: Vec<f64> = Vec::new();
+    let mut timeouts = 0u64;
+    for i in 0..samples {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(interval));
+        }
+        let s = q.latency_probe(key, Duration::from_secs(2)).map_err(|err| Fail::Failed(err.to_string()))?;
+        if s.timed_out {
+            timeouts += 1;
+        } else {
+            ms.push(s.elapsed_us as f64 / 1000.0);
+        }
+    }
+    if ms.is_empty() {
+        return Err(Fail::Failed(format!(
+            "the screen did not change after any of {samples} key presses: run `qorral-bench --scene latency` in \
+             the guest, in the foreground"
+        )));
+    }
+    let mut sorted = ms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let at = |q: f64| sorted[((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1];
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    if o.json {
+        print_json(json!({
+            "samples": ms.len(), "timeouts": timeouts, "key": key,
+            "median_ms": at(0.5), "p90_ms": at(0.9), "min_ms": sorted[0], "max_ms": sorted[sorted.len() - 1],
+            "mean_ms": mean, "values_ms": ms,
+        }));
+    } else {
+        println!(
+            "input to display (key into QEMU to the changed frame at QEMU's display): median {:.2} ms, \
+             p90 {:.2}, min {:.2}, max {:.2}, mean {:.2} ({} samples{})",
+            at(0.5),
+            at(0.9),
+            sorted[0],
+            sorted[sorted.len() - 1],
+            mean,
+            ms.len(),
+            if timeouts > 0 { format!(", {timeouts} timed out") } else { String::new() }
+        );
     }
     Ok(())
 }

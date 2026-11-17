@@ -515,6 +515,9 @@ bool D3D12Device::endFrame(const std::string* capturePath) {
 }
 
 double D3D12Device::waitPresented(std::string& source) {
+    // GPU first, so a failed statistics wait does not add to the fallback time.
+    signalAndWait();
+    const LONGLONG gpuDone = d3d::qpcNow();
     double ms = 0.0;
     if (!opt_.offscreen && statsFailures_ < 3) {
         if (d3d::waitDxgiDisplayed(swap_.get(), frameStartQpc_, ms)) {
@@ -524,9 +527,8 @@ double D3D12Device::waitPresented(std::string& source) {
         }
         ++statsFailures_;
     }
-    signalAndWait();
     source = "gpu";
-    return d3d::qpcMs(frameStartQpc_, d3d::qpcNow());
+    return d3d::qpcMs(frameStartQpc_, gpuDone);
 }
 
 void D3D12Device::finishFrames() {

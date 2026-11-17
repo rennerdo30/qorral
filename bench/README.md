@@ -63,6 +63,22 @@ in the output and in the JSON (`"variant"`).
   raymarch, instanced and postfx are pixel-identical between Vulkan, Direct3D 10, 11 and 12, and
   nearly so for OpenGL and Direct3D 9 (MSAA resolve). Particles depend slightly on the frame timing.
 
+## Latency
+
+`--scene latency` (not part of `all` or the score) shows a black screen that turns white for 250 ms
+after every key or mouse-button press, and renders one frame at a time.
+
+- **In the guest:** each frame waits until it is displayed, and the benchmark reports the time from
+  the frame's start (`latency_ms` in the JSON, with its `source`):
+  - `display`: the API reported when the frame was shown (DXGI frame statistics for D3D10, 11 and
+    12, present statistics for D3D9Ex, `VK_KHR_present_wait` for Vulkan);
+  - `gpu`: the API cannot tell, so this is the time until the GPU finished the frame (OpenGL,
+    offscreen runs, and drivers without these features).
+- **Input to display, from the host:** with the scene running in a VM, `qorral latency <vm>` presses
+  a key through QEMU and times until the changed frame reaches QEMU's display (Qorral's QEMU
+  `x-qorral-latency-probe`). It reports median, p90, min and max over `--samples` presses. Showing
+  the frame in a host window comes on top of that number.
+
 ## Command line
 
 ```

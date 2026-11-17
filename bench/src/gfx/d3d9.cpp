@@ -468,6 +468,9 @@ bool D3D9Device::endFrame(const std::string* capturePath) {
 }
 
 double D3D9Device::waitPresented(std::string& source) {
+    // GPU first, so a failed statistics wait does not add to the fallback time.
+    waitIdle();
+    const LONGLONG gpuDone = d3d::qpcNow();
     if (!opt_.offscreen && statsFailures_ < 3) {
         Com<IDirect3DSwapChain9> sc;
         Com<IDirect3DSwapChain9Ex> sc9ex;
@@ -492,9 +495,8 @@ double D3D9Device::waitPresented(std::string& source) {
         }
         ++statsFailures_;
     }
-    waitIdle();
     source = "gpu";
-    return d3d::qpcMs(frameStartQpc_, d3d::qpcNow());
+    return d3d::qpcMs(frameStartQpc_, gpuDone);
 }
 
 void D3D9Device::finishFrames() {

@@ -7,7 +7,7 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Replies larger than this are a protocol error, not a reason to allocate.
 const MAX_LINE: usize = 16 * 1024 * 1024;
@@ -44,8 +44,22 @@ impl From<std::io::Error> for QmpError {
 pub struct Qmp {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
+    timeout: Duration,
     /// Events received while waiting for replies, oldest first.
     pub events: Vec<Value>,
+}
+
+/// One input-to-display measurement from Qorral's QEMU (`x-qorral-latency-probe`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatencySample {
+    /// From the key entering QEMU's input layer to the display update that changed the probe pixel.
+    pub elapsed_us: u64,
+    /// Display updates QEMU saw while waiting.
+    pub updates: u64,
+    pub timed_out: bool,
+    /// Probe pixel brightness (0-255) before the key and at the last update read.
+    pub before: u8,
+    pub after: u8,
 }
 
 impl Qmp {
@@ -57,7 +71,7 @@ impl Qmp {
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
         let writer = stream.try_clone()?;
-        let mut q = Qmp { reader: BufReader::new(stream), writer, events: Vec::new() };
+        let mut q = Qmp { reader: BufReader::new(stream), writer, timeout, events: Vec::new() };
         let greeting = q.read_message()?;
         if greeting.get("QMP").is_none() {
             return Err(QmpError::Protocol(format!("unexpected greeting: {greeting}")));
@@ -110,6 +124,50 @@ impl Qmp {
             }
             return Err(QmpError::Protocol(format!("unexpected message: {m}")));
         }
+    }
+
+    /// Waits for the next event called `name` (events that arrived earlier are checked first).
+    pub fn wait_event(&mut self, name: &str, timeout: Duration) -> Result<Value, QmpError> {
+        if let Some(i) = self.events.iter().position(|e| e["event"] == name) {
+            return Ok(self.events.remove(i));
+        }
+        let deadline = Instant::now() + timeout;
+        let result = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(QmpError::Protocol(format!("no {name} event within {} ms", timeout.as_millis())));
+            }
+            if let Err(e) = self.reader.get_ref().set_read_timeout(Some(left)) {
+                break Err(e.into());
+            }
+            match self.read_message() {
+                Ok(m) if m["event"] == name => break Ok(m),
+                Ok(m) if m.get("event").is_some() => self.events.push(m),
+                Ok(_) => {} // a stray reply; nothing is pending
+                Err(QmpError::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => break Err(e),
+            }
+        };
+        let _ = self.reader.get_ref().set_read_timeout(Some(self.timeout));
+        result
+    }
+
+    /// Presses `key` (a QEMU qcode) and times until the guest's screen changes at its centre:
+    /// dark to bright or bright to dark. Needs Qorral's QEMU build.
+    pub fn latency_probe(&mut self, key: &str, timeout: Duration) -> Result<LatencySample, QmpError> {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.execute("x-qorral-latency-probe", Some(json!({ "key": key, "timeout-ms": ms })))?;
+        let ev = self.wait_event("QORRAL_LATENCY", timeout + Duration::from_secs(2))?;
+        let d = &ev["data"];
+        let byte = |v: &Value| u8::try_from(v.as_u64().unwrap_or(0).min(255)).unwrap_or(0);
+        Ok(LatencySample {
+            elapsed_us: d["elapsed-us"].as_u64().unwrap_or(0),
+            updates: d["updates"].as_u64().unwrap_or(0),
+            timed_out: d["timed-out"].as_bool().unwrap_or(true),
+            before: byte(&d["before"]),
+            after: byte(&d["after"]),
+        })
     }
 
     /// `running`, `paused`, `shutdown`, … (QEMU's RunState).
@@ -199,5 +257,24 @@ mod tests {
         let r = Qmp::connect(port, Duration::from_secs(5));
         assert!(r.is_err());
         h.join().unwrap();
+    }
+
+    #[test]
+    fn latency_probe_reads_the_event() {
+        let (port, h) = fake_qemu(vec![
+            "{\"return\": {}}
+",
+            // An unrelated event first, then the probe's result after the command's reply.
+            "{\"event\": \"RESUME\", \"timestamp\": {}}
+{\"return\": {}}
+{\"event\": \"QORRAL_LATENCY\", \"data\": {\"elapsed-us\": 4210, \"updates\": 3, \"timed-out\": false, \"before\": 0, \"after\": 255}}
+",
+        ]);
+        let mut q = Qmp::connect(port, Duration::from_secs(5)).unwrap();
+        let s = q.latency_probe("spc", Duration::from_secs(1)).unwrap();
+        assert_eq!(s, LatencySample { elapsed_us: 4210, updates: 3, timed_out: false, before: 0, after: 255 });
+        assert_eq!(q.events.len(), 1, "the unrelated event is kept");
+        let sent = h.join().unwrap();
+        assert!(sent[1].contains("x-qorral-latency-probe") && sent[1].contains("\"spc\""));
     }
 }
