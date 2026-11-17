@@ -45,6 +45,9 @@ usage: qorral [command] [options]      (no command: open the app)
   share remove <vm> <name> | share list <vm>
   share cache <vm> auto|strict          auto (default): fast with small files, host changes
                                         show up within a second; strict: at once, slower
+                                        guest writes reach the host when the file is closed
+                                        (or the program ends, e.g. when exec returns); for a
+                                        file still open in the guest, run sync or fsync first
   base freeze <vm> [--name N]           freeze a stopped machine into a read-only base
   base list                             bases and what uses them
   base delete <name> --yes              delete a base nothing uses any more
