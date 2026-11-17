@@ -177,7 +177,7 @@ if(QB_D3D)
   list(APPEND SOURCES src/gfx/d3d_common.h src/gfx/d3d_common.cpp src/gfx/d3d9.cpp src/gfx/d3d10.cpp
        src/gfx/d3d11.cpp src/gfx/d3d12.cpp)
   list(APPEND DEFS QB_HAVE_D3D)
-  list(APPEND LIBS d3d9 d3d10_1 d3d11 d3d12 dxgi dxguid)
+  list(APPEND LIBS d3d9 d3d11 d3d12 dxgi dxguid)  # d3d10_1.dll is loaded at run time
 endif()
 
 add_executable(qorral-bench ${SOURCES})
