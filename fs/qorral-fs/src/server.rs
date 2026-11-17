@@ -476,7 +476,39 @@ mod tests {
         assert_eq!((entry.attr_valid, entry.entry_valid), (1, 1), "attributes and names 1 s");
         let flags = open_flags(&mut g, entry.nodeid);
         assert!(flags & FOPEN_DIRECT_IO == 0 && flags & (1 << 5) != 0, "auto: {flags:#x}");
+        assert!(flags & (1 << 1) != 0, "auto keeps the page cache across opens: {flags:#x}");
         assert!(Server::from_json(r#"{"shares":[],"cache":"fast"}"#).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_is_unsupported_for_linux_guests_only() {
+        let dir = temp_dir("flush");
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        for (posix, want) in [(true, -38), (false, 0)] {
+            let mut g = Guest {
+                server: Server::with_options(&[share("s", &dir, false)], CacheMode::Auto, posix).unwrap(),
+                unique: 0,
+            };
+            let init = fuse_init_in {
+                major: FUSE_KERNEL_VERSION,
+                minor: FUSE_KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: 0,
+                flags2: 0,
+                unused: [0; 11],
+            };
+            g.call(FUSE_INIT, 0, &[init.as_bytes()]);
+            let s = g.lookup(FUSE_ROOT_ID, "s").unwrap();
+            let f = g.lookup(s, "f.txt").unwrap();
+            let (h, body) = g.call(FUSE_OPEN, f, &[fuse_open_in { flags: 0, unused: 0 }.as_bytes()]);
+            assert_eq!(h.error, 0);
+            let fh = fuse_open_out::read_from_prefix(&body).unwrap().0.fh;
+            let flush = fuse_flush_in { fh, unused: 0, padding: 0, lock_owner: 0 };
+            let (h, _) = g.call(FUSE_FLUSH, f, &[flush.as_bytes()]);
+            // Linux stops sending FLUSH after ENOSYS; Windows reads it as an error.
+            assert_eq!(h.error, want, "posix={posix}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

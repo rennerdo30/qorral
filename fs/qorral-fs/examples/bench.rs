@@ -120,8 +120,7 @@ fn main() {
 
     println!(
         "host only, 1000 files: create+write {create_ms:.0} ms ({:.0} us/file), lookup+getattr {stat_ms:.0} ms, open+read {read_ms:.0} ms; {} requests",
-        create_ms,
-        c.unique
+        create_ms, c.unique
     );
     for i in 0..1000 {
         let _ = std::fs::remove_file(dir.join(format!("f{i}.txt")));

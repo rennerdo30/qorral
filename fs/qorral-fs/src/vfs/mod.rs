@@ -74,6 +74,11 @@ pub enum CacheMode {
 /// qorral: don't send FLUSH on close (Linux >= 5.17 honours it). FLUSH has
 /// nothing to do here, and skipping it saves a round trip per close.
 const FOPEN_NOFLUSH: u32 = 1 << 5;
+/// qorral: keep the guest's page cache across opens (auto mode). Without it
+/// every open drops the cached data and the next read goes to the host again;
+/// FUSE_AUTO_INVAL_DATA still drops it when the host file changes (its mtime
+/// or size differ when the attributes are refreshed).
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 const AUTO_ATTRIBUTE_TIMEOUT: Duration = Duration::from_secs(1);
 const AUTO_ENTRY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -512,7 +517,15 @@ impl Fuse for VirtioFs {
     // host file, so there is nothing to do but check the handle. Upstream
     // returns ENOSYS, which the Linux client accepts but the Windows client
     // turns into an error (it maps errno 38 to "name too long").
+    //
+    // Linux guests (exact case) do get ENOSYS: their kernel then stops sending
+    // FLUSH altogether, one round trip less per close. FOPEN_NOFLUSH does not
+    // do that once the writeback cache is on (the kernel flushes dirty pages
+    // with WRITE requests first either way).
     fn flush(&self, request: &Request, arg: &fuse_flush_in) -> lx::Result<()> {
+        if self.exact_case() {
+            return Err(lx::Error::ENOSYS);
+        }
         if self.is_synthetic_root_handle(request.node_id(), arg.fh) {
             return Ok(());
         }
@@ -684,7 +697,12 @@ impl VirtioFs {
     /// like any lookup, so the client's later FORGET stays balanced.
     pub fn lookup_self(&self, node_id: u64) -> lx::Result<fuse_entry_out> {
         if self.is_synthetic_root(node_id) {
-            return Ok(fuse_entry_out::new(FUSE_ROOT_ID, self.entry_timeout(), self.attr_timeout(), self.synthetic_root_attr()));
+            return Ok(fuse_entry_out::new(
+                FUSE_ROOT_ID,
+                self.entry_timeout(),
+                self.attr_timeout(),
+                self.synthetic_root_attr(),
+            ));
         }
         let inode = self.get_inode(node_id)?;
         let attr = inode.get_attr()?;
@@ -756,7 +774,7 @@ impl VirtioFs {
         FOPEN_NOFLUSH
             | match self.inner.cache {
                 CacheMode::Strict => FOPEN_DIRECT_IO,
-                CacheMode::Auto => 0,
+                CacheMode::Auto => FOPEN_KEEP_CACHE,
             }
     }
 
