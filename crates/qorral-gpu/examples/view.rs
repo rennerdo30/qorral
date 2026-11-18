@@ -48,6 +48,7 @@ fn main() {
         imports: (u32, u32),
         errors: Vec<String>,
         mode: Option<PresentMode>,
+        queue: &'static str,
     }
 
     /// The guest display fitted into the window, centred, aspect kept.
@@ -171,6 +172,7 @@ fn main() {
                             match Compositor::for_window(&device_uuid, win, w, h, prefer) {
                                 Ok(c) => {
                                     st.mode = c.present_mode();
+                                    st.queue = c.queue_path();
                                     st.comp = Some(c);
                                 }
                                 Err(err) => st.errors.push(err.to_string()),
@@ -313,7 +315,10 @@ fn main() {
     drop(comp);
     drop(app.window.take());
 
-    println!("present mode: {:?}; guest buffers imported: {} ({} zero copy)", st.mode, st.imports.0, st.imports.1);
+    println!(
+        "present mode: {:?}, composed on the {} queue; guest buffers imported: {} ({} zero copy)",
+        st.mode, st.queue, st.imports.0, st.imports.1
+    );
     for e in st.errors.iter().take(5) {
         println!("error: {e}");
     }

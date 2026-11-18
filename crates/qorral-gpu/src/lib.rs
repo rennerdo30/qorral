@@ -22,8 +22,12 @@ const FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 const VERT: &[u8] = include_bytes!("../shaders/fullscreen.vert.spv");
 const FRAG_BUFFER: &[u8] = include_bytes!("../shaders/guest.frag.spv");
 const FRAG_IMAGE: &[u8] = include_bytes!("../shaders/guest_image.frag.spv");
+const COMPOSE: &[u8] = include_bytes!("../shaders/compose.comp.spv");
 const MAX_GUEST_BUFFERS: u32 = 64;
 const PUSH_SIZE: u32 = 32;
+const COMPOSE_PUSH: u32 = 48;
+/// Storage descriptors for swapchain images (one per image).
+const MAX_TARGETS: u32 = 16;
 
 #[derive(Debug)]
 pub enum Error {
@@ -143,6 +147,19 @@ struct Pipeline {
     pipeline: vk::Pipeline,
 }
 
+/// Window frames composed on a compute queue (`compose.comp`). On a GPU with separate
+/// compute queues the frame runs beside the guest's graphics work instead of waiting
+/// behind it in the graphics queue.
+struct Compute {
+    queue: vk::Queue,
+    family: u32,
+    commands: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    target_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
 /// The device, pipelines and target. One per window (or per offscreen renderer).
 pub struct Compositor {
     _entry: ash::Entry,
@@ -152,6 +169,11 @@ pub struct Compositor {
     queue: vk::Queue,
     queue_family: u32,
     queue_families: Vec<u32>,
+    /// The graphics and compute families the compositor's own images are shared between.
+    own_families: Vec<u32>,
+    /// A compute-only family to compose window frames on, when the device offers one.
+    compute_family: Option<u32>,
+    compute: Option<Compute>,
     memory_types: vk::PhysicalDeviceMemoryProperties,
     pub device_name: String,
 
@@ -199,10 +221,15 @@ struct Window {
     swapchain: vk::SwapchainKHR,
     mode: vk::PresentModeKHR,
     extent: vk::Extent2D,
+    images: Vec<vk::Image>,
     views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
     acquired: vk::Semaphore,
     rendered: vk::Semaphore,
+    /// The compute queue can present here and the swapchain images take storage writes.
+    compute: bool,
+    /// One storage descriptor per swapchain image (compute frames).
+    targets: Vec<vk::DescriptorSet>,
 }
 
 /// The offscreen target and its readback buffer.
@@ -312,9 +339,37 @@ impl Compositor {
         if windowed {
             ext_names.push(ash::khr::swapchain::NAME.as_ptr());
         }
+        // Window frames go to a compute-only queue when there is one, the shader can write
+        // the swapchain's format without naming it, and nobody asked for the graphics queue.
+        // SAFETY: a plain query on a live physical device.
+        let features = unsafe { instance.get_physical_device_features(physical) };
+        let compute_family = if windowed
+            && features.shader_storage_image_write_without_format == vk::TRUE
+            && std::env::var("QORRAL_GPU_QUEUE").map_or(true, |v| v != "graphics")
+        {
+            families
+                .iter()
+                .position(|f| {
+                    f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                })
+                .map(|i| i as u32)
+        } else {
+            None
+        };
         let prio = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
-        let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&ext_names);
+        let mut queues =
+            vec![vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
+        if let Some(f) = compute_family {
+            queues.push(vk::DeviceQueueCreateInfo::default().queue_family_index(f).queue_priorities(&prio));
+        }
+        let enabled = vk::PhysicalDeviceFeatures {
+            shader_storage_image_write_without_format: if compute_family.is_some() { vk::TRUE } else { vk::FALSE },
+            ..Default::default()
+        };
+        let info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&ext_names)
+            .enabled_features(&enabled);
         // SAFETY: valid create info; destroyed in Drop (or below on failure).
         let device = unsafe { instance.create_device(physical, &info, None) }.map_err(vkr("vkCreateDevice"))?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -328,6 +383,9 @@ impl Compositor {
             queue,
             queue_family,
             queue_families: (0..families.len() as u32).collect(),
+            own_families: std::iter::once(queue_family).chain(compute_family).collect(),
+            compute_family,
+            compute: None,
             memory_types,
             device_name,
             pool: vk::DescriptorPool::null(),
@@ -358,7 +416,110 @@ impl Compositor {
         c.image_pipe = c.create_pipeline(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, FRAG_IMAGE)?;
         c.buffer_pipe = c.create_pipeline(vk::DescriptorType::STORAGE_BUFFER, FRAG_BUFFER)?;
         c.create_target(width, height)?;
+        if let Some(family) = c.compute_family {
+            match c.create_compute(family) {
+                Ok(k) => c.compute = Some(k),
+                Err(e) => eprintln!("qorral-gpu: composing on the graphics queue ({e})"),
+            }
+        }
         Ok(c)
+    }
+
+    /// Which queue window frames with a zero-copy guest are composed on.
+    pub fn queue_path(&self) -> &'static str {
+        match &self.window {
+            Some(w) if w.compute => "compute",
+            _ => "graphics",
+        }
+    }
+
+    fn create_compute(&self, family: u32) -> Result<Compute, Error> {
+        let d = &self.device;
+        let mut k = Compute {
+            // SAFETY: the family was requested at device creation with one queue.
+            queue: unsafe { d.get_device_queue(family, 0) },
+            family,
+            commands: vk::CommandPool::null(),
+            cmd: vk::CommandBuffer::null(),
+            target_layout: vk::DescriptorSetLayout::null(),
+            layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+        };
+        // SAFETY: valid create infos; on failure everything created so far is destroyed.
+        let result = unsafe {
+            (|| -> Result<(), Error> {
+                let bindings = [vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+                k.target_layout = d
+                    .create_descriptor_set_layout(
+                        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                        None,
+                    )
+                    .map_err(vkr("compute target layout"))?;
+                let sets = [self.image_pipe.set_layout, self.image_pipe.set_layout, k.target_layout];
+                let push = [vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::COMPUTE,
+                    offset: 0,
+                    size: COMPOSE_PUSH,
+                }];
+                k.layout = d
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets).push_constant_ranges(&push),
+                        None,
+                    )
+                    .map_err(vkr("compute pipeline layout"))?;
+                let words = ash::util::read_spv(&mut std::io::Cursor::new(COMPOSE))
+                    .map_err(|e| Error::Unsupported(format!("bad shader: {e}")))?;
+                let module = d
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
+                    .map_err(vkr("compute shader"))?;
+                let info = [vk::ComputePipelineCreateInfo::default()
+                    .stage(
+                        vk::PipelineShaderStageCreateInfo::default()
+                            .stage(vk::ShaderStageFlags::COMPUTE)
+                            .module(module)
+                            .name(c"main"),
+                    )
+                    .layout(k.layout)];
+                let pipe = d.create_compute_pipelines(vk::PipelineCache::null(), &info, None);
+                d.destroy_shader_module(module, None);
+                k.pipeline = pipe.map_err(|(_, r)| Error::Vk("compute pipeline", r))?[0];
+                k.commands = d
+                    .create_command_pool(
+                        &vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(family)
+                            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                        None,
+                    )
+                    .map_err(vkr("compute command pool"))?;
+                k.cmd = d
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default().command_pool(k.commands).command_buffer_count(1),
+                    )
+                    .map_err(vkr("compute command buffer"))?[0];
+                Ok(())
+            })()
+        };
+        match result {
+            Ok(()) => Ok(k),
+            Err(e) => {
+                self.destroy_compute(&k);
+                Err(e)
+            }
+        }
+    }
+
+    fn destroy_compute(&self, k: &Compute) {
+        // SAFETY: null handles are ignored; the GPU is idle when this is called.
+        unsafe {
+            self.device.destroy_command_pool(k.commands, None);
+            self.device.destroy_pipeline(k.pipeline, None);
+            self.device.destroy_pipeline_layout(k.layout, None);
+            self.device.destroy_descriptor_set_layout(k.target_layout, None);
+        }
     }
 
     fn memory_type(&self, bits: u32, want: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -377,12 +538,13 @@ impl Compositor {
                     ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                     descriptor_count: MAX_GUEST_BUFFERS,
                 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: MAX_TARGETS },
             ];
             self.pool = d
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
                         .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                        .max_sets(MAX_GUEST_BUFFERS)
+                        .max_sets(MAX_GUEST_BUFFERS + MAX_TARGETS)
                         .pool_sizes(&sizes),
                     None,
                 )
@@ -448,7 +610,8 @@ impl Compositor {
             .binding(0)
             .descriptor_type(ty)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            // Compute too: the compute presenter binds the same guest and overlay sets.
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE)];
         // SAFETY: valid create infos; on failure the partial pipeline is destroyed.
         unsafe {
             let result = (|| -> Result<(), Error> {
@@ -890,25 +1053,11 @@ impl Compositor {
             if let Some(g) = guest {
                 match g.0 {
                     Guest::Image { image, .. } => {
-                        // Take the guest's image from the external queue (QEMU's renderer), keeping
-                        // its contents (GENERAL to GENERAL: no layout change that could discard them).
-                        let acquire = [vk::ImageMemoryBarrier::default()
-                            .src_access_mask(vk::AccessFlags::empty())
-                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                            .old_layout(vk::ImageLayout::GENERAL)
-                            .new_layout(vk::ImageLayout::GENERAL)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                            .dst_queue_family_index(self.queue_family)
-                            .image(*image)
-                            .subresource_range(color_range())];
-                        d.cmd_pipeline_barrier(
+                        self.acquire_guest_image(
                             self.cmd,
-                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            *image,
+                            self.queue_family,
                             vk::PipelineStageFlags::FRAGMENT_SHADER,
-                            vk::DependencyFlags::empty(),
-                            &[],
-                            &[],
-                            &acquire,
                         );
                     }
                     Guest::Buffer { buffer, copy, layout: l, .. } => {
@@ -959,66 +1108,7 @@ impl Compositor {
                     }
                 }
             }
-            if let Some(o) = &self.overlay
-                && o.dirty.get()
-            {
-                let to_dst = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_READ)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(o.image)
-                    .subresource_range(color_range())];
-                d.cmd_pipeline_barrier(
-                    self.cmd,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_dst,
-                );
-                d.cmd_copy_buffer_to_image(
-                    self.cmd,
-                    o.staging,
-                    o.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy {
-                        buffer_offset: 0,
-                        buffer_row_length: 0,
-                        buffer_image_height: 0,
-                        image_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                        image_extent: vk::Extent3D { width: o.width, height: o.height, depth: 1 },
-                    }],
-                );
-                let to_read = [vk::ImageMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(o.image)
-                    .subresource_range(color_range())];
-                d.cmd_pipeline_barrier(
-                    self.cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &to_read,
-                );
-                o.dirty.set(false);
-            }
+            self.upload_overlay(self.cmd, vk::PipelineStageFlags::FRAGMENT_SHADER);
             let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.06, 0.06, 0.07, 1.0] } }];
             d.cmd_begin_render_pass(
                 self.cmd,
@@ -1063,6 +1153,189 @@ impl Compositor {
                 self.draw_quad(&self.image_pipe, o.set, &push, o.rect, extent);
             }
             d.cmd_end_render_pass(self.cmd);
+        }
+        Ok(())
+    }
+
+    /// Takes the guest's image from the external queue (QEMU's renderer) for `family`, keeping
+    /// its contents (GENERAL to GENERAL: no layout change that could discard them).
+    fn acquire_guest_image(
+        &self,
+        cmd: vk::CommandBuffer,
+        image: vk::Image,
+        family: u32,
+        stage: vk::PipelineStageFlags,
+    ) {
+        let acquire = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+            .dst_queue_family_index(family)
+            .image(image)
+            .subresource_range(color_range())];
+        // SAFETY: `cmd` is being recorded; the image is live.
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &acquire,
+            );
+        }
+    }
+
+    /// Uploads the overlay if it changed, for reading in `stage` (a stage `cmd`'s queue has).
+    fn upload_overlay(&self, cmd: vk::CommandBuffer, stage: vk::PipelineStageFlags) {
+        let d = &self.device;
+        // SAFETY: `cmd` is being recorded; handles are live; every frame is waited for.
+        unsafe {
+            if let Some(o) = &self.overlay
+                && o.dirty.get()
+            {
+                let to_dst = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(o.image)
+                    .subresource_range(color_range())];
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    stage,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_dst,
+                );
+                d.cmd_copy_buffer_to_image(
+                    cmd,
+                    o.staging,
+                    o.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D { width: o.width, height: o.height, depth: 1 },
+                    }],
+                );
+                let to_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(o.image)
+                    .subresource_range(color_range())];
+                d.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    stage,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_read,
+                );
+                o.dirty.set(false);
+            }
+        }
+    }
+
+    /// Records a window frame for the compute queue into `k.cmd`: guest image `id` fitted into
+    /// `dst`, the overlay on top, every pixel of swapchain `image` (storage set `target`)
+    /// written by `compose.comp`, which leaves the image ready to present.
+    fn record_compute(
+        &self,
+        k: &Compute,
+        id: u32,
+        dst: [f32; 4],
+        target: vk::DescriptorSet,
+        image: vk::Image,
+        extent: vk::Extent2D,
+    ) -> Result<(), Error> {
+        let Some(Guest::Image { image: guest_image, set, src, .. }) = self.guests.get(&id) else {
+            return Err(Error::Unsupported(format!("guest buffer {id} is not a zero-copy image")));
+        };
+        let d = &self.device;
+        let stage = vk::PipelineStageFlags::COMPUTE_SHADER;
+        // SAFETY: the compute command buffer is not in use (every frame is waited for); the
+        // handles are live.
+        unsafe {
+            d.reset_command_buffer(k.cmd, vk::CommandBufferResetFlags::empty()).map_err(vkr("reset"))?;
+            d.begin_command_buffer(
+                k.cmd,
+                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(vkr("begin"))?;
+            self.acquire_guest_image(k.cmd, *guest_image, k.family, stage);
+            self.upload_overlay(k.cmd, stage);
+            // Every pixel is written: the old contents are not needed (UNDEFINED). The stage
+            // matches the acquire semaphore's wait, so the write waits for the image.
+            let to_write = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range())];
+            d.cmd_pipeline_barrier(k.cmd, stage, stage, vk::DependencyFlags::empty(), &[], &[], &to_write);
+            // The overlay's set when it has pixels; otherwise the guest's (bound, never read).
+            let (overlay_set, orect) = match &self.overlay {
+                Some(o) if o.ready => (o.set, o.rect),
+                _ => (*set, [0.0; 4]),
+            };
+            let mut push = [0u8; COMPOSE_PUSH as usize];
+            for (i, v) in dst.iter().chain(src.iter()).chain(orect.iter()).enumerate() {
+                push[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            d.cmd_bind_pipeline(k.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+            d.cmd_bind_descriptor_sets(
+                k.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                k.layout,
+                0,
+                &[*set, overlay_set, target],
+                &[],
+            );
+            d.cmd_push_constants(k.cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, &push);
+            d.cmd_dispatch(k.cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
+            let to_present = [vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(color_range())];
+            d.cmd_pipeline_barrier(
+                k.cmd,
+                stage,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &to_present,
+            );
+            d.end_command_buffer(k.cmd).map_err(vkr("end"))?;
         }
         Ok(())
     }
@@ -1195,8 +1468,11 @@ impl Compositor {
             extent: vk::Extent2D { width, height },
             views: Vec::new(),
             framebuffers: Vec::new(),
+            images: Vec::new(),
             acquired,
             rendered,
+            compute: false,
+            targets: Vec::new(),
         });
         self.resize(width, height)
     }
@@ -1234,6 +1510,11 @@ impl Compositor {
             for v in w.views.drain(..) {
                 d.destroy_image_view(v, None);
             }
+            if !w.targets.is_empty() {
+                let _ = d.free_descriptor_sets(self.pool, &w.targets);
+                w.targets.clear();
+            }
+            w.images.clear();
             if extent.width == 0 || extent.height == 0 {
                 // Minimised: nothing to present into until it is restored.
                 w.extent = extent;
@@ -1241,6 +1522,17 @@ impl Compositor {
             }
             let max = if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count };
             let count = (caps.min_image_count + 1).min(max);
+            // Compute frames write the swapchain images as storage and present from the
+            // compute queue; both must be possible on this surface.
+            w.compute = self.compute.as_ref().is_some_and(|k| {
+                caps.supported_usage_flags.contains(vk::ImageUsageFlags::STORAGE)
+                    && w.surface_fn.get_physical_device_surface_support(self.physical, k.family, w.surface) == Ok(true)
+            });
+            let (usage, sharing) = if w.compute {
+                (vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::STORAGE, vk::SharingMode::CONCURRENT)
+            } else {
+                (vk::ImageUsageFlags::COLOR_ATTACHMENT, vk::SharingMode::EXCLUSIVE)
+            };
             let old = w.swapchain;
             w.swapchain = w
                 .swapchain_fn
@@ -1252,8 +1544,9 @@ impl Compositor {
                         .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
                         .image_extent(extent)
                         .image_array_layers(1)
-                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .image_usage(usage)
+                        .image_sharing_mode(sharing)
+                        .queue_family_indices(if w.compute { &self.own_families } else { &[] })
                         .pre_transform(caps.current_transform)
                         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                         .present_mode(w.mode)
@@ -1275,7 +1568,30 @@ impl Compositor {
                         None,
                     )
                     .map_err(vkr("swapchain view"))?;
+                w.images.push(image);
                 w.views.push(view);
+                if let Some(k) = self.compute.as_ref().filter(|_| w.compute) {
+                    let layouts = [k.target_layout];
+                    let set = d
+                        .allocate_descriptor_sets(
+                            &vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.pool).set_layouts(&layouts),
+                        )
+                        .map_err(vkr("swapchain storage set"))?[0];
+                    let info = [vk::DescriptorImageInfo {
+                        sampler: vk::Sampler::null(),
+                        image_view: view,
+                        image_layout: vk::ImageLayout::GENERAL,
+                    }];
+                    d.update_descriptor_sets(
+                        &[vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .image_info(&info)],
+                        &[],
+                    );
+                    w.targets.push(set);
+                }
                 let views = [view];
                 w.framebuffers.push(
                     d.create_framebuffer(
@@ -1360,7 +1676,14 @@ impl Compositor {
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    // Either queue may draw a frame (compute or graphics).
+                    .sharing_mode(if self.own_families.len() > 1 {
+                        vk::SharingMode::CONCURRENT
+                    } else {
+                        vk::SharingMode::EXCLUSIVE
+                    })
+                    .queue_family_indices(if self.own_families.len() > 1 { &self.own_families } else { &[] }),
                 None,
             ) {
                 Ok(i) => i,
@@ -1471,29 +1794,46 @@ impl Compositor {
             let t1 = Instant::now();
             let (framebuffer, extent, acquired_sem, rendered_sem, swapchain) =
                 (w.framebuffers[index as usize], w.extent, w.acquired, w.rendered, w.swapchain);
-            self.begin()?;
-            self.record(guest.map(|id| (id, dst)), self.present_pass, framebuffer, extent)?;
+            // A zero-copy guest frame is composed on the compute queue when the window allows it.
+            let compute_target = match (w.compute, guest.and_then(|id| self.guests.get(&id))) {
+                (true, Some(Guest::Image { .. })) => {
+                    w.targets.get(index as usize).copied().zip(w.images.get(index as usize).copied())
+                }
+                _ => None,
+            };
+            let (cmd, queue, stage) = match (compute_target, self.compute.as_ref(), guest) {
+                (Some((set, image)), Some(k), Some(id)) => {
+                    self.record_compute(k, id, dst, set, image, extent)?;
+                    (k.cmd, k.queue, vk::PipelineStageFlags::COMPUTE_SHADER)
+                }
+                _ => {
+                    self.begin()?;
+                    self.record(guest.map(|id| (id, dst)), self.present_pass, framebuffer, extent)?;
+                    // SAFETY: the command buffer was begun above.
+                    unsafe { self.device.end_command_buffer(self.cmd) }.map_err(vkr("end"))?;
+                    (self.cmd, self.queue, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+                }
+            };
             let d = &self.device;
             let presented;
-            // SAFETY: the command buffer was begun above; handles are live.
+            // SAFETY: the command buffer was recorded above; handles are live.
             unsafe {
-                d.end_command_buffer(self.cmd).map_err(vkr("end"))?;
-                let cmds = [self.cmd];
+                let cmds = [cmd];
                 let waits = [acquired_sem];
-                let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let stages = [stage];
                 let signals = [rendered_sem];
                 let submit = [vk::SubmitInfo::default()
                     .wait_semaphores(&waits)
                     .wait_dst_stage_mask(&stages)
                     .command_buffers(&cmds)
                     .signal_semaphores(&signals)];
-                d.queue_submit(self.queue, &submit, self.fence).map_err(vkr("submit"))?;
+                d.queue_submit(queue, &submit, self.fence).map_err(vkr("submit"))?;
                 let t2 = Instant::now();
                 let swapchains = [swapchain];
                 let indices = [index];
                 presented = self.window.as_ref().map(|w| {
                     w.swapchain_fn.queue_present(
-                        self.queue,
+                        queue,
                         &vk::PresentInfoKHR::default()
                             .wait_semaphores(&signals)
                             .swapchains(&swapchains)
@@ -1571,6 +1911,9 @@ impl Drop for Compositor {
                 w.surface_fn.destroy_surface(w.surface, None);
                 self.device.destroy_semaphore(w.acquired, None);
                 self.device.destroy_semaphore(w.rendered, None);
+            }
+            if let Some(k) = self.compute.take() {
+                self.destroy_compute(&k);
             }
             self.destroy_pipeline(&self.image_pipe);
             self.destroy_pipeline(&self.buffer_pipe);

@@ -1,0 +1,37 @@
+#version 450
+// Composes a window frame on a compute queue, writing every pixel of the swapchain
+// image directly: the clear colour, the guest's scanout (zero copy, sampled from its
+// own image exactly like guest_image.frag), and the UI overlay on top. On a compute
+// queue this runs beside the guest's graphics work instead of waiting behind it.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D guest;
+layout(set = 1, binding = 0) uniform sampler2D overlay;
+// No format qualifier (shaderStorageImageWriteWithoutFormat): the view is B8G8R8A8.
+layout(set = 2, binding = 0) uniform writeonly image2D target;
+
+layout(push_constant) uniform Params {
+    vec4 dst;    // guest destination rectangle in target pixels: x, y, w, h
+    vec4 src;    // guest source rectangle in guest texels: x, y, w, h
+    vec4 orect;  // overlay rectangle in target pixels (w = 0: no overlay)
+} p;
+
+bool inside(vec2 c, vec4 r) {
+    return c.x >= r.x && c.y >= r.y && c.x < r.x + r.z && c.y < r.y + r.w;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(px, imageSize(target)))) {
+        return;
+    }
+    vec2 c = vec2(px) + 0.5;
+    vec4 color = vec4(0.06, 0.06, 0.07, 1.0);
+    if (p.orect.z > 0.0 && inside(c, p.orect)) {
+        color = vec4(textureLod(overlay, (c - p.orect.xy) / p.orect.zw, 0.0).rgb, 1.0);
+    } else if (inside(c, p.dst)) {
+        vec2 t = p.src.xy + (c - p.dst.xy) * p.src.zw / p.dst.zw;
+        color = vec4(textureLod(guest, t / vec2(textureSize(guest, 0)), 0.0).rgb, 1.0);
+    }
+    imageStore(target, px, color);
+}
