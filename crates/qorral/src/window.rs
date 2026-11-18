@@ -81,6 +81,10 @@ struct App {
     console: Option<crate::console::Console>,
     /// The UI's pixels while a console is open (the compositor shows the title row from it).
     backing: Vec<u32>,
+    /// The guest's pointer (shown while the pointer is over the guest) and whether it shows.
+    guest_cursor: Option<winit::window::CustomCursor>,
+    guest_cursor_visible: bool,
+    over_guest: bool,
 }
 
 pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
@@ -151,6 +155,9 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         #[cfg(windows)]
         console: None,
         backing: Vec::new(),
+        guest_cursor: None,
+        guest_cursor_visible: true,
+        over_guest: false,
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("qorral: event loop failed: {e}");
@@ -405,6 +412,10 @@ impl App {
     fn close_console(&mut self) {
         #[cfg(windows)]
         drop(self.console.take());
+        self.over_guest = false;
+        self.guest_cursor = None;
+        self.guest_cursor_visible = true;
+        self.update_cursor();
         // The compositor drew the window: the CPU path repaints all of it.
         if let Some(ui) = &mut self.ui {
             ui.invalidate();
@@ -440,6 +451,7 @@ impl App {
                     ui.close_console();
                 }
             }
+            E::Cursor { .. } | E::CursorVisible(_) => {}
         }
     }
 
@@ -510,7 +522,7 @@ impl App {
             self.handle(a);
         }
         if let (Some(g), Some(ui)) = (&self.gfx, &self.ui) {
-            if ui.pointer_cursor_is_hand() != self.hand {
+            if !self.over_guest && ui.pointer_cursor_is_hand() != self.hand {
                 self.hand = ui.pointer_cursor_is_hand();
                 g.window.set_cursor(if self.hand { CursorIcon::Pointer } else { CursorIcon::Default });
             }
@@ -606,6 +618,22 @@ impl App {
         self.render();
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
+        }
+    }
+
+    /// Over the guest: the guest's own pointer (or none when the guest hides it); elsewhere the
+    /// UI's.
+    fn update_cursor(&mut self) {
+        let Some(g) = &self.gfx else { return };
+        if self.over_guest && self.console_open() {
+            g.window.set_cursor_visible(self.guest_cursor_visible);
+            match &self.guest_cursor {
+                Some(c) => g.window.set_cursor(c.clone()),
+                None => g.window.set_cursor(CursorIcon::Default),
+            }
+        } else {
+            g.window.set_cursor_visible(true);
+            g.window.set_cursor(if self.hand { CursorIcon::Pointer } else { CursorIcon::Default });
         }
     }
 
@@ -752,6 +780,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.exit_code = 1;
                 el.exit();
             }
+            UserEvent::Console(crate::console::ConsoleEvent::Cursor { rgba, width, height, hot_x, hot_y }) => {
+                self.guest_cursor = winit::window::CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y)
+                    .ok()
+                    .map(|src| el.create_custom_cursor(src));
+                self.update_cursor();
+            }
+            UserEvent::Console(crate::console::ConsoleEvent::CursorVisible(v)) => {
+                self.guest_cursor_visible = v;
+                self.update_cursor();
+            }
             other => {
                 self.apply(other);
                 self.after_input();
@@ -812,7 +850,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor = (position.x as i32, position.y as i32);
                 #[cfg(windows)]
                 if let Some(c) = &mut self.console {
-                    c.pointer(position.x, position.y);
+                    let inside = c.pointer(position.x, position.y);
+                    if inside != self.over_guest {
+                        self.over_guest = inside;
+                        self.update_cursor();
+                    }
                 }
                 if let Some(ui) = &mut self.ui {
                     ui.pointer_move(self.cursor.0, self.cursor.1);

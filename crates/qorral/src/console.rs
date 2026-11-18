@@ -19,6 +19,10 @@ pub enum ConsoleEvent {
     Failed(String, String),
     /// QEMU closed the display connection (the machine stopped).
     Disconnected(String),
+    /// The guest's pointer image: RGBA rows, size, hotspot.
+    Cursor { rgba: Vec<u8>, width: u16, height: u16, hot_x: u16, hot_y: u16 },
+    /// The guest shows or hides its pointer.
+    CursorVisible(bool),
 }
 
 #[cfg(windows)]
@@ -50,6 +54,7 @@ mod imp {
         resized: bool,
         live: bool,
         failed: bool,
+        cursor_visible: Option<bool>,
     }
 
     impl Shared {
@@ -123,6 +128,7 @@ mod imp {
                 bar_dirty: false,
                 resized: false,
                 live: false,
+                cursor_visible: None,
                 failed: false,
             }));
             let (sh, id_owned) = (shared.clone(), id.to_string());
@@ -169,6 +175,11 @@ mod imp {
                 return None;
             }
             Some(((fx * s.guest.0 as f32) as u32, (fy * s.guest.1 as f32) as u32))
+        }
+
+        /// The pointer is over the guest (as of the last move).
+        pub fn pointer_inside(&self) -> bool {
+            self.inside
         }
 
         /// The pointer moved; returns whether it is over the guest.
@@ -329,6 +340,29 @@ mod imp {
                     if let Some(c) = s.comp.as_mut() {
                         c.forget(resource_id);
                     }
+                }
+                Some(Event::CursorDefine { width, height, hot_x, hot_y, data }) => {
+                    let (w, h) = (width.clamp(0, 256) as usize, height.clamp(0, 256) as usize);
+                    if w > 0 && h > 0 && data.len() >= w * h * 4 {
+                        // QEMU's cursor pixels are 32-bit ARGB words: bytes B, G, R, A.
+                        let rgba = data[..w * h * 4]
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+                            .collect();
+                        notify(ConsoleEvent::Cursor {
+                            rgba,
+                            width: w as u16,
+                            height: h as u16,
+                            hot_x: hot_x.clamp(0, w as i32 - 1) as u16,
+                            hot_y: hot_y.clamp(0, h as i32 - 1) as u16,
+                        });
+                    }
+                }
+                Some(Event::MouseSet { visible, .. }) if s.cursor_visible != Some(visible) => {
+                    s.cursor_visible = Some(visible);
+                    notify(ConsoleEvent::CursorVisible(visible));
                 }
                 None => notify(ConsoleEvent::Disconnected(id.clone())),
                 _ => {}
