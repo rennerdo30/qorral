@@ -55,6 +55,8 @@ mod imp {
         live: bool,
         failed: bool,
         cursor_visible: Option<bool>,
+        /// QORRAL_TRACE: flip received to presented, per frame (ms).
+        trace: Option<Vec<f32>>,
     }
 
     impl Shared {
@@ -131,6 +133,7 @@ mod imp {
                 resized: false,
                 live: false,
                 cursor_visible: None,
+                trace: std::env::var_os("QORRAL_TRACE").map(|_| Vec::with_capacity(300)),
                 failed: false,
             }));
             let (sh, id_owned) = (shared.clone(), id.to_string());
@@ -353,8 +356,26 @@ mod imp {
                     }
                 }
                 Some(Event::FlipBlob { resource_id, .. }) => {
+                    let t0 = std::time::Instant::now();
                     s.last = resource_id;
                     s.present();
+                    if resource_id != 0 && s.comp.is_some() {
+                        let (w, h) = s.guest;
+                        if let Some(t) = s.trace.as_mut() {
+                            t.push(t0.elapsed().as_secs_f32() * 1000.0);
+                            if t.len() >= 300 {
+                                t.sort_by(f32::total_cmp);
+                                eprintln!(
+                                    "qorral: console {id} {w}x{h}: flip received to presented over {} frames: median {:.3} ms, p99 {:.3} ms, max {:.3} ms",
+                                    t.len(),
+                                    t[t.len() / 2],
+                                    t[t.len() * 99 / 100],
+                                    t[t.len() - 1]
+                                );
+                                t.clear();
+                            }
+                        }
+                    }
                     if resource_id != 0 && s.comp.is_some() && !s.live {
                         s.live = true;
                         notify(ConsoleEvent::Live(id.clone()));
