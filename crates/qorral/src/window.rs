@@ -49,6 +49,8 @@ fn send(p: &Proxy, e: UserEvent) {
     }
 }
 
+type WinSurface = Surface<Rc<Window>, Rc<Window>>;
+
 struct Gfx {
     window: Rc<Window>,
     surface: Surface<Rc<Window>, Rc<Window>>,
@@ -83,6 +85,11 @@ struct App {
     console: Option<crate::console::Console>,
     /// The UI's pixels while a console is open (the compositor shows the title row from it).
     backing: Vec<u32>,
+    /// Remote session: the console's guest area must be drawn completely on the next frame.
+    console_full: bool,
+    /// QORRAL_TRACE: CPU-path guest frames (draw and present, ms) and when the batch began.
+    cpu_trace: Option<Vec<f32>>,
+    cpu_trace_t0: Option<Instant>,
     /// The guest's pointer in the main window's console.
     gp: GuestPointer,
     /// Consoles in their own windows.
@@ -175,6 +182,67 @@ struct PopOut {
     window: Rc<Window>,
     console: crate::console::Console,
     gp: GuestPointer,
+    /// Remote session: the window's software surface and pixels (no compositor there).
+    cpu: Option<(WinSurface, Vec<u32>)>,
+}
+
+impl PopOut {
+    /// Remote session: draws the guest's changed pixels (all of them with `full`) and
+    /// presents only those.
+    #[cfg(windows)]
+    fn render_cpu(&mut self, full: bool) {
+        let Some((surface, backing)) = self.cpu.as_mut() else { return };
+        let sz = self.window.inner_size();
+        let (w, h) = (sz.width as usize, sz.height as usize);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let full = full || backing.len() != w * h;
+        if backing.len() != w * h {
+            *backing = vec![0; w * h];
+            if let (Some(nw), Some(nh)) = (NonZeroU32::new(sz.width), NonZeroU32::new(sz.height)) {
+                let _ = surface.resize(nw, nh);
+            }
+        }
+        let rects = self.console.draw_cpu(backing, w, h, full);
+        present_backing(surface, backing, w, h, &rects);
+    }
+}
+
+/// Copies rectangles `rects` (x, y, w, h) of `backing` (`w` x `h`) into the window's buffer
+/// and presents only them. A buffer of unknown age gets everything.
+fn present_backing(
+    surface: &mut Surface<Rc<Window>, Rc<Window>>,
+    backing: &[u32],
+    w: usize,
+    h: usize,
+    rects: &[[i32; 4]],
+) {
+    let Ok(mut buf) = surface.buffer_mut() else { return };
+    if buf.len() < w * h || backing.len() < w * h {
+        return;
+    }
+    let all = [[0, 0, w as i32, h as i32]];
+    let rects = if buf.age() == 1 { rects } else { &all[..] };
+    let mut damage = Vec::with_capacity(rects.len());
+    for r in rects {
+        let (x0, y0) = (r[0].clamp(0, w as i32) as usize, r[1].clamp(0, h as i32) as usize);
+        let (x1, y1) = ((r[0] + r[2]).clamp(0, w as i32) as usize, (r[1] + r[3]).clamp(0, h as i32) as usize);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        for y in y0..y1 {
+            buf[y * w + x0..y * w + x1].copy_from_slice(&backing[y * w + x0..y * w + x1]);
+        }
+        if let (Some(dw), Some(dh)) = (NonZeroU32::new((x1 - x0) as u32), NonZeroU32::new((y1 - y0) as u32)) {
+            damage.push(softbuffer::Rect { x: x0 as u32, y: y0 as u32, width: dw, height: dh });
+        }
+    }
+    if !damage.is_empty()
+        && let Err(e) = buf.present_with_damage(&damage)
+    {
+        eprintln!("qorral: present failed: {e}");
+    }
 }
 
 pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
@@ -246,6 +314,9 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         #[cfg(windows)]
         console: None,
         backing: Vec::new(),
+        console_full: false,
+        cpu_trace: std::env::var_os("QORRAL_TRACE").map(|_| Vec::with_capacity(300)),
+        cpu_trace_t0: Some(Instant::now()),
         gp: GuestPointer::default(),
         #[cfg(windows)]
         popouts: Vec::new(),
@@ -500,8 +571,10 @@ impl App {
                 (gfx.hwnd, hinstance),
                 (self.size.0 as u32, self.size.1 as u32),
                 [g.x as f32, g.y as f32, g.w as f32, g.h as f32],
+                ui.remote,
                 notify,
             ));
+            self.console_full = true;
         }
         #[cfg(not(windows))]
         {
@@ -539,7 +612,7 @@ impl App {
         #[cfg(windows)]
         {
             let id = match &ev {
-                E::Attached(id, _) | E::Live(id) | E::Failed(id, _) | E::Disconnected(id) => id.clone(),
+                E::Attached(id, _) | E::Live(id) | E::Failed(id, _) | E::Disconnected(id) | E::Frame(id) => id.clone(),
                 E::Cursor { id, .. } | E::CursorVisible(id, _) => id.clone(),
             };
             let main = self.console.as_ref().is_some_and(|c| c.id == id);
@@ -555,6 +628,7 @@ impl App {
                     E::Disconnected(_) => {
                         self.popouts.remove(i);
                     }
+                    E::Frame(_) => self.popouts[i].render_cpu(false),
                     E::Live(_) | E::Cursor { .. } | E::CursorVisible(..) => {}
                 }
                 return;
@@ -587,60 +661,71 @@ impl App {
                     ui.close_console();
                 }
             }
+            E::Frame(id) => {
+                if ui.console.as_deref() == Some(id.as_str())
+                    && let Some(g) = &self.gfx
+                {
+                    g.window.request_redraw();
+                }
+            }
             E::Cursor { .. } | E::CursorVisible(..) => {}
         }
     }
 
     /// Console mode: the UI paints into the backing store; the title row goes to the
-    /// compositor, which owns the window once the first guest frame is in. Until then the
-    /// CPU path shows the backing store. Returns false outside console mode.
+    /// compositor, which owns the window once the first guest frame is in. Until then (and
+    /// for good in a remote session, where the guest is drawn on the CPU too) the CPU path
+    /// shows the backing store. Returns false outside console mode.
     #[cfg(windows)]
     fn render_console(&mut self) -> bool {
         let (Some(gfx), Some(ui), Some(c)) = (&mut self.gfx, &mut self.ui, &self.console) else { return false };
         let (w, h) = self.size;
-        if w == 0 || h == 0 || !ui.has_damage() {
+        if w == 0 || h == 0 || (!ui.has_damage() && !c.cpu_pending()) {
             return true;
         }
         if self.backing.len() != w * h {
             self.backing = vec![0; w * h];
             ui.invalidate();
+            self.console_full = true;
         }
-        let painted = ui.paint(&mut Canvas::new(&mut self.backing[..], w, h), false);
-        let bar_h = (ui.console_bar_height().max(0) as usize).min(h);
-        c.set_bar(&self.backing[..w * bar_h], w as u32, bar_h as u32);
+        let painted = if ui.has_damage() {
+            let p = ui.paint(&mut Canvas::new(&mut self.backing[..], w, h), false);
+            let bar_h = (ui.console_bar_height().max(0) as usize).min(h);
+            c.set_bar(&self.backing[..w * bar_h], w as u32, bar_h as u32);
+            p
+        } else {
+            Vec::new()
+        };
         if c.is_presenting() {
             return true;
         }
-        let Ok(mut buf) = gfx.surface.buffer_mut() else { return true };
-        if buf.len() < w * h {
-            return true;
-        }
-        buf[..w * h].copy_from_slice(&self.backing);
-        let full = buf.age() == 0;
-        let rects: Vec<softbuffer::Rect> = if full {
-            vec![softbuffer::Rect {
-                x: 0,
-                y: 0,
-                width: NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN),
-                height: NonZeroU32::new(h as u32).unwrap_or(NonZeroU32::MIN),
-            }]
-        } else {
-            painted
-                .iter()
-                .filter_map(|r| {
-                    Some(softbuffer::Rect {
-                        x: r.x.max(0) as u32,
-                        y: r.y.max(0) as u32,
-                        width: NonZeroU32::new(r.w.max(0) as u32)?,
-                        height: NonZeroU32::new(r.h.max(0) as u32)?,
-                    })
-                })
-                .collect()
-        };
-        if !rects.is_empty()
-            && let Err(e) = buf.present_with_damage(&rects)
-        {
-            eprintln!("qorral: present failed: {e}");
+        // Remote session: the guest's changed pixels, all of them when the UI painted over its
+        // area (or the backing store is new).
+        let g = ui.console_guest_rect();
+        let full = std::mem::take(&mut self.console_full) || painted.iter().any(|r| !r.intersect(g).is_empty());
+        let t0 = Instant::now();
+        let mut rects: Vec<[i32; 4]> = painted.iter().map(|r| [r.x, r.y, r.w, r.h]).collect();
+        let guest = c.draw_cpu(&mut self.backing, w, h, full);
+        let drew_guest = !guest.is_empty();
+        rects.extend(guest);
+        present_backing(&mut gfx.surface, &self.backing, w, h, &rects);
+        // QORRAL_TRACE: what a guest frame costs the UI thread on the CPU path.
+        if drew_guest && let Some(t) = self.cpu_trace.as_mut() {
+            t.push(t0.elapsed().as_secs_f32() * 1000.0);
+            if t.len() >= 300 || self.cpu_trace_t0.is_some_and(|s| s.elapsed().as_secs() >= 5) {
+                let secs = self.cpu_trace_t0.map_or(0.0, |s| s.elapsed().as_secs_f32());
+                t.sort_by(f32::total_cmp);
+                eprintln!(
+                    "qorral: console {}: CPU path, guest drawn and presented over {} frames ({:.0}/s): median {:.3} ms, p99 {:.3} ms",
+                    c.id,
+                    t.len(),
+                    t.len() as f32 / secs.max(0.001),
+                    t[t.len() / 2],
+                    t[t.len() * 99 / 100]
+                );
+                t.clear();
+                self.cpu_trace_t0 = Some(Instant::now());
+            }
         }
         true
     }
@@ -809,15 +894,30 @@ impl App {
             let sz = window.inner_size();
             let p = self.proxy.clone();
             let notify: crate::console::Notify = Arc::new(move |ev| send(&p, UserEvent::Console(ev)));
+            let remote = platform::is_remote_session();
+            let cpu = if remote {
+                match Context::new(window.clone()).and_then(|c| Surface::new(&c, window.clone())) {
+                    Ok(s) => Some((s, Vec::new())),
+                    Err(e) => {
+                        if let Some(ui) = &mut self.ui {
+                            ui.set_toast(Some(format!("Could not open a console window: {e}")));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let console = crate::console::Console::open(
                 &id,
                 self.lib_root.clone(),
                 (hwnd, hinstance),
                 (sz.width, sz.height),
                 [0.0, 0.0, sz.width as f32, sz.height as f32],
+                remote,
                 notify,
             );
-            self.popouts.push(PopOut { window, console, gp: GuestPointer::default() });
+            self.popouts.push(PopOut { window, console, gp: GuestPointer::default(), cpu });
         }
     }
 
@@ -838,6 +938,7 @@ impl App {
             WindowEvent::Resized(sz) => {
                 p.console.resize((sz.width, sz.height), [0.0, 0.0, sz.width as f32, sz.height as f32]);
                 p.console.redraw();
+                p.render_cpu(true);
             }
             WindowEvent::Focused(false) => {
                 p.console.release_keys();
@@ -1111,6 +1212,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(c) = &self.console {
                         let g = ui.console_guest_rect();
                         c.resize((sz.width, sz.height), [g.x as f32, g.y as f32, g.w as f32, g.h as f32]);
+                        self.console_full = true;
                     }
                 }
                 self.after_input();

@@ -19,6 +19,8 @@ pub enum ConsoleEvent {
     Failed(String, String),
     /// QEMU closed the display connection (the machine stopped).
     Disconnected(String),
+    /// Remote session: guest pixels changed; the UI thread draws them (`Console::draw_cpu`).
+    Frame(String),
     /// The guest's pointer image: RGBA rows, size, hotspot.
     Cursor { id: String, rgba: Vec<u8>, width: u16, height: u16, hot_x: u16, hot_y: u16 },
     /// The guest shows or hides its pointer.
@@ -30,7 +32,7 @@ mod imp {
     use super::ConsoleEvent;
     use qorral_core::Library;
     use qorral_core::qmp::Qmp;
-    use qorral_display::{Button, Caps, Display, Event};
+    use qorral_display::{Button, Caps, Display, Event, SharedMap};
     use qorral_gpu::{Compositor, GuestMemory, ImageParams, Layout, NativeWindow, PresentMode};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -39,8 +41,50 @@ mod imp {
 
     pub type Notify = Arc<dyn Fn(ConsoleEvent) + Send + Sync>;
 
+    /// `PIXMAN_x8r8g8b8` and `PIXMAN_a8r8g8b8`: 32-bit words 0xXXRRGGBB, the backing store's own
+    /// layout. The only formats the CPU path draws.
+    const XRGB: [u32; 2] = [0x2002_0888, 0x2002_8888];
+    /// Behind the guest, where it does not fill its area (the compositor's clear colour).
+    const CLEAR: u32 = 0x0F0F12;
+
+    /// Remote sessions: the guest's pixels in host memory, drawn by the software renderer.
+    /// QEMU's own shared mapping when it offers one (nothing is copied before drawing), else a
+    /// copy of the pixels sent inside the messages.
+    struct CpuGuest {
+        map: Option<SharedMap>,
+        own: Vec<u8>,
+        width: u32,
+        height: u32,
+        stride: u32,
+        /// Guest rectangles changed since the UI thread last drew (x, y, w, h).
+        damage: Vec<[i32; 4]>,
+    }
+
+    impl CpuGuest {
+        fn bytes(&self) -> &[u8] {
+            self.map.as_ref().map_or(&self.own, |m| m.bytes())
+        }
+
+        fn damage(&mut self, x: i32, y: i32, w: i32, h: i32) {
+            // Many small rectangles cost more to scale one by one than their bounding box.
+            if self.damage.len() >= 16 {
+                let b = self.damage.iter().fold([x, y, x + w, y + h], |b, r| {
+                    [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[0] + r[2]), b[3].max(r[1] + r[3])]
+                });
+                self.damage = vec![[b[0], b[1], b[2] - b[0], b[3] - b[1]]];
+            } else {
+                self.damage.push([x, y, w, h]);
+            }
+        }
+    }
+
     /// Everything the frame thread and the UI thread share.
     struct Shared {
+        /// Remote session: guest pixels come through host memory, not the GPU.
+        remote: bool,
+        cpu: Option<CpuGuest>,
+        /// A `Frame` wake-up is on its way to the UI thread (one at a time).
+        cpu_wake: bool,
         comp: Option<Compositor>,
         window: NativeWindow,
         size: (u32, u32),
@@ -63,13 +107,17 @@ mod imp {
     }
 
     impl Shared {
-        /// The guest fitted into the area, centred, aspect kept.
+        /// The guest fitted into the area, centred, aspect kept. A remote session never scales
+        /// up: 1:1 stays sharp, costs plain row copies and sends the remote link no blur.
         fn dst(&self) -> [f32; 4] {
             let a = self.area;
             if self.guest.0 == 0 || self.guest.1 == 0 {
                 return a;
             }
-            let k = (a[2] / self.guest.0 as f32).min(a[3] / self.guest.1 as f32);
+            let mut k = (a[2] / self.guest.0 as f32).min(a[3] / self.guest.1 as f32);
+            if self.remote {
+                k = k.min(1.0);
+            }
             let (w, h) = ((self.guest.0 as f32 * k).round(), (self.guest.1 as f32 * k).round());
             [(a[0] + (a[2] - w) / 2.0).round(), (a[1] + (a[3] - h) / 2.0).round(), w, h]
         }
@@ -115,16 +163,22 @@ mod imp {
     }
 
     impl Console {
-        /// Starts attaching to machine `id` (on a worker); `area` is where its screen goes.
+        /// Starts attaching to machine `id` (on a worker); `area` is where its screen goes. In a
+        /// `remote` session the guest's pixels come through host memory and the UI thread draws
+        /// them ([`Console::draw_cpu`]); otherwise the GPU shows them zero copy.
         pub fn open(
             id: &str,
             root: PathBuf,
             window: (isize, isize),
             size: (u32, u32),
             area: [f32; 4],
+            remote: bool,
             notify: Notify,
         ) -> Console {
             let shared = Arc::new(Mutex::new(Shared {
+                remote,
+                cpu: None,
+                cpu_wake: false,
                 comp: None,
                 window: NativeWindow { hwnd: window.0, hinstance: window.1 },
                 size,
@@ -156,6 +210,67 @@ mod imp {
         /// The compositor owns the window's pixels (the CPU path must not present).
         pub fn is_presenting(&self) -> bool {
             self.shared.lock().is_ok_and(|s| s.comp.is_some())
+        }
+
+        /// Guest pixels changed that [`Console::draw_cpu`] has not drawn yet.
+        pub fn cpu_pending(&self) -> bool {
+            self.shared.lock().is_ok_and(|s| s.cpu.as_ref().is_some_and(|c| !c.damage.is_empty()))
+        }
+
+        /// Remote session: draws the guest's changed pixels (all of them, and the background
+        /// around the guest, with `full`) into `dst`, a `w` x `h` backing store, fitted into the
+        /// guest area. Returns the window rectangles it wrote (x, y, w, h).
+        pub fn draw_cpu(&self, dst: &mut [u32], w: usize, h: usize, full: bool) -> Vec<[i32; 4]> {
+            let Ok(mut s) = self.shared.lock() else { return Vec::new() };
+            s.cpu_wake = false;
+            let (fit, area) = (s.dst(), s.area);
+            let Some(g) = s.cpu.as_mut() else { return Vec::new() };
+            let damage = std::mem::take(&mut g.damage);
+            let (gw, gh) = (g.width as i32, g.height as i32);
+            if gw == 0 || gh == 0 || dst.len() < w * h || fit[2] < 1.0 || fit[3] < 1.0 {
+                return Vec::new();
+            }
+            let clip = |r: [f32; 4]| {
+                let (x0, y0) = ((r[0] as i32).max(0), (r[1] as i32).max(0));
+                let (x1, y1) = (((r[0] + r[2]) as i32).min(w as i32), ((r[1] + r[3]) as i32).min(h as i32));
+                (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+            };
+            let f = [fit[0] as i32, fit[1] as i32, fit[2] as i32, fit[3] as i32];
+            let Some(fc) = clip(fit) else { return Vec::new() };
+            let mut out = Vec::new();
+            let rects: Vec<[i32; 4]> = if full {
+                // The whole guest area: the bars around the fitted guest in the background.
+                if let Some(a) = clip(area) {
+                    for y in a[1]..a[1] + a[3] {
+                        let row = y as usize * w;
+                        dst[row + a[0] as usize..row + (a[0] + a[2]) as usize].fill(CLEAR);
+                    }
+                    out.push(a);
+                }
+                vec![fc]
+            } else {
+                // Each guest rectangle in window pixels, a pixel wider for the filter's reach.
+                let (kx, ky) = (f[2] as f32 / gw as f32, f[3] as f32 / gh as f32);
+                let (x1, y1) = (fc[0] + fc[2], fc[1] + fc[3]);
+                damage
+                    .iter()
+                    .filter_map(|r| {
+                        let rx0 = ((r[0] as f32 * kx).floor() as i32 + f[0] - 1).max(fc[0]);
+                        let ry0 = ((r[1] as f32 * ky).floor() as i32 + f[1] - 1).max(fc[1]);
+                        let rx1 = (((r[0] + r[2]) as f32 * kx).ceil() as i32 + f[0] + 1).min(x1);
+                        let ry1 = (((r[1] + r[3]) as f32 * ky).ceil() as i32 + f[1] + 1).min(y1);
+                        (rx1 > rx0 && ry1 > ry0).then_some([rx0, ry0, rx1 - rx0, ry1 - ry0])
+                    })
+                    .collect()
+            };
+            let src = Src { bytes: g.bytes(), width: g.width, height: g.height, stride: g.stride };
+            for r in &rects {
+                scale_into(&src, dst, w, f, *r);
+            }
+            if out.is_empty() {
+                out = rects;
+            }
+            out
         }
 
         /// A new title row (rows of `w` pixels): drawn over the guest from now on, and
@@ -289,6 +404,77 @@ mod imp {
         }
     }
 
+    /// Guest pixels in host memory: `height` rows of `stride` bytes, 0xXXRRGGBB words.
+    struct Src<'a> {
+        bytes: &'a [u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+    }
+
+    impl Src<'_> {
+        /// Row `y` as pixels (bounds checked once per row; empty if out of range).
+        fn row(&self, y: u32) -> &[[u8; 4]] {
+            let start = y as usize * self.stride as usize;
+            let end = start + self.width as usize * 4;
+            self.bytes.get(start..end).map_or(&[], |r| r.as_chunks::<4>().0)
+        }
+    }
+
+    #[inline]
+    fn rgb(p: [u8; 4]) -> u32 {
+        u32::from_le_bytes(p) & 0xFF_FFFF
+    }
+
+    /// Draws window rectangle `r` (inside `fit`) of the guest fitted into `fit` (x, y, w, h)
+    /// into `dst` (rows of `dw` pixels): a plain copy at 1:1, else bilinear with 8-bit weights.
+    fn scale_into(s: &Src, dst: &mut [u32], dw: usize, fit: [i32; 4], r: [i32; 4]) {
+        let (sw, sh) = (i64::from(s.width), i64::from(s.height));
+        if i64::from(fit[2]) == sw && i64::from(fit[3]) == sh {
+            let (gx, n) = ((r[0] - fit[0]) as usize, r[2] as usize);
+            for y in r[1]..r[1] + r[3] {
+                let src = s.row((y - fit[1]) as u32);
+                let Some(src) = src.get(gx..gx + n) else { continue };
+                let out = &mut dst[y as usize * dw + r[0] as usize..][..n];
+                for (o, p) in out.iter_mut().zip(src) {
+                    *o = rgb(*p);
+                }
+            }
+            return;
+        }
+        // 16.16 fixed point: where each destination pixel's centre falls in the source, as the
+        // two source pixels around it and the weight (of 256) of the second.
+        let (step_x, step_y) = ((sw << 16) / i64::from(fit[2]), (sh << 16) / i64::from(fit[3]));
+        let pos = |d: i32, step: i64, max: i64| -> (u32, u32, u32) {
+            let p = ((i64::from(d) * 2 + 1) * step / 2 - (1 << 15)).clamp(0, (max - 1) << 16);
+            let i0 = (p >> 16) as u32;
+            (i0, (i0 + 1).min(max as u32 - 1), ((p >> 8) & 0xff) as u32)
+        };
+        let xs: Vec<(u32, u32, u32)> = (r[0]..r[0] + r[2]).map(|x| pos(x - fit[0], step_x, sw)).collect();
+        for y in r[1]..r[1] + r[3] {
+            let (y0, y1, fy) = pos(y - fit[1], step_y, sh);
+            let (a, b) = (s.row(y0), s.row(y1));
+            if a.len() < s.width as usize || b.len() < s.width as usize {
+                continue;
+            }
+            let row = &mut dst[y as usize * dw + r[0] as usize..][..xs.len()];
+            for (out, &(x0, x1, fx)) in row.iter_mut().zip(&xs) {
+                let (x0, x1) = (x0 as usize, x1 as usize);
+                let top = lerp(rgb(a[x0]), rgb(a[x1]), fx);
+                let bottom = lerp(rgb(b[x0]), rgb(b[x1]), fx);
+                *out = lerp(top, bottom, fy);
+            }
+        }
+    }
+
+    /// Blends two 0x00RRGGBB colours: `t` of 256 parts of `b`, the rest of `a`.
+    #[inline]
+    fn lerp(a: u32, b: u32, t: u32) -> u32 {
+        let rb = (((a & 0xFF00FF) * (256 - t) + (b & 0xFF00FF) * t) >> 8) & 0xFF00FF;
+        let g = (((a & 0xFF00) * (256 - t) + (b & 0xFF00) * t) >> 8) & 0xFF00;
+        rb | g
+    }
+
     fn attach(root: &std::path::Path, id: &str, shared: Arc<Mutex<Shared>>, notify: Notify) -> Result<Display, String> {
         let lib = Library::new(root);
         let e = lib.list().into_iter().find(|e| e.id == id).ok_or_else(|| format!("{id} no longer exists"))?;
@@ -300,9 +486,94 @@ mod imp {
             q.execute(cmd, Some(serde_json::Value::Object(a))).map(drop).map_err(|e| e.to_string())
         };
         let id = id.to_string();
-        Display::attach(run.pid, 0, Caps { vulkan: true, ..Caps::default() }, &mut qmp, move |ev| {
+        let remote = shared.lock().is_ok_and(|s| s.remote);
+        // Remote sessions draw on the CPU: QEMU's shared memory (never the GPU path).
+        let caps =
+            if remote { Caps { map: true, ..Caps::default() } } else { Caps { vulkan: true, ..Caps::default() } };
+        Display::attach(run.pid, 0, caps, &mut qmp, move |ev| {
             let Ok(mut s) = shared.lock() else { return };
+            // Remote: new guest pixels; wake the UI thread once until it has drawn them.
+            let wake = |s: &mut Shared| {
+                if !s.cpu_wake {
+                    s.cpu_wake = true;
+                    notify(ConsoleEvent::Frame(id.clone()));
+                }
+                if !s.live {
+                    s.live = true;
+                    notify(ConsoleEvent::Live(id.clone()));
+                }
+            };
             match ev {
+                Some(Event::ScanoutMap { handle, offset, width, height, stride, format }) => {
+                    let len = stride as usize * height as usize;
+                    if !XRGB.contains(&format) || u64::from(stride) < u64::from(width) * 4 {
+                        close_handle(handle);
+                        notify(ConsoleEvent::Failed(id.clone(), format!("unsupported guest pixel format {format:#x}")));
+                        return;
+                    }
+                    // The handle is the map's from here (closed with it, also on failure).
+                    match SharedMap::open(handle, offset, len) {
+                        Ok(map) => {
+                            if s.trace.is_some() {
+                                eprintln!("qorral: console {id}: guest screen {width}x{height} read in place (shared memory)");
+                            }
+                            s.guest = (width, height);
+                            s.cpu = Some(CpuGuest {
+                                map: Some(map),
+                                own: Vec::new(),
+                                width,
+                                height,
+                                stride,
+                                damage: vec![[0, 0, width as i32, height as i32]],
+                            });
+                            wake(&mut s);
+                        }
+                        Err(e) => notify(ConsoleEvent::Failed(id.clone(), format!("guest screen not readable: {e}"))),
+                    }
+                }
+                Some(Event::UpdateMap { x, y, width, height }) => {
+                    if let Some(g) = s.cpu.as_mut().filter(|g| g.map.is_some()) {
+                        g.damage(x, y, width, height);
+                        wake(&mut s);
+                    }
+                }
+                Some(Event::Scanout { width, height, stride, format, data }) => {
+                    let len = stride as usize * height as usize;
+                    if XRGB.contains(&format) && u64::from(stride) >= u64::from(width) * 4 && data.len() >= len {
+                        if s.trace.is_some() {
+                            eprintln!("qorral: console {id}: guest screen {width}x{height} sent inside the messages");
+                        }
+                        s.guest = (width, height);
+                        s.cpu = Some(CpuGuest {
+                            map: None,
+                            own: data[..len].to_vec(),
+                            width,
+                            height,
+                            stride,
+                            damage: vec![[0, 0, width as i32, height as i32]],
+                        });
+                        wake(&mut s);
+                    }
+                }
+                Some(Event::Update { x, y, width, height, stride, format, data }) => {
+                    let Some(g) = s.cpu.as_mut().filter(|g| g.map.is_none()) else { return };
+                    let (x0, y0) = (x.max(0) as usize, y.max(0) as usize);
+                    let w = (width.max(0) as usize).min((g.width as usize).saturating_sub(x0));
+                    let h = (height.max(0) as usize).min((g.height as usize).saturating_sub(y0));
+                    if !XRGB.contains(&format) || data.len() < stride as usize * h || (stride as usize) < w * 4 {
+                        return;
+                    }
+                    let gs = g.stride as usize;
+                    for row in 0..h {
+                        let to = (y0 + row) * gs + x0 * 4;
+                        let from = row * stride as usize;
+                        if let (Some(d), Some(src)) = (g.own.get_mut(to..to + w * 4), data.get(from..from + w * 4)) {
+                            d.copy_from_slice(src);
+                        }
+                    }
+                    g.damage(x0 as i32, y0 as i32, w as i32, h as i32);
+                    wake(&mut s);
+                }
                 Some(Event::ScanoutBlob {
                     resource_id,
                     handle,
@@ -446,5 +717,58 @@ mod imp {
     fn close_handle(h: u64) {
         // SAFETY: a handle QEMU duplicated into this process for us.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(h as usize as _) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn guest(w: u32, h: u32, px: impl Fn(u32, u32) -> u32) -> Vec<u8> {
+            let mut v = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    v.extend_from_slice(&(px(x, y) | 0xFF00_0000).to_le_bytes());
+                }
+            }
+            v
+        }
+
+        #[test]
+        fn one_to_one_is_a_copy_without_alpha() {
+            let bytes = guest(4, 3, |x, y| x * 0x10 + y * 0x1000);
+            let s = Src { bytes: &bytes, width: 4, height: 3, stride: 16 };
+            let mut dst = vec![0u32; 6 * 5];
+            scale_into(&s, &mut dst, 6, [1, 1, 4, 3], [1, 1, 4, 3]);
+            assert_eq!(dst[6 + 1], 0);
+            assert_eq!(dst[2 * 6 + 3], 2 * 0x10 + 0x1000);
+            assert_eq!(dst[0], 0, "outside the rectangle untouched");
+        }
+
+        #[test]
+        fn scaling_keeps_flat_colour_exact_and_blends_edges() {
+            let bytes = guest(8, 8, |x, _| if x < 4 { 0x204060 } else { 0xC0E0FF });
+            let s = Src { bytes: &bytes, width: 8, height: 8, stride: 32 };
+            let mut dst = vec![0u32; 5 * 5];
+            scale_into(&s, &mut dst, 5, [0, 0, 5, 5], [0, 0, 5, 5]);
+            assert_eq!(dst[0], 0x204060, "flat areas stay exact");
+            assert_eq!(dst[4], 0xC0E0FF);
+            let mid = dst[2];
+            assert!(mid != 0x204060 && mid != 0xC0E0FF, "the edge blends: {mid:#08x}");
+            assert!((mid >> 16) > 0x20 && (mid >> 16) < 0xC0);
+        }
+
+        #[test]
+        fn a_damage_rectangle_writes_only_inside() {
+            let bytes = guest(16, 16, |_, _| 0x123456);
+            let s = Src { bytes: &bytes, width: 16, height: 16, stride: 64 };
+            let mut dst = vec![0u32; 10 * 10];
+            scale_into(&s, &mut dst, 10, [0, 0, 10, 10], [2, 3, 4, 2]);
+            for y in 0..10 {
+                for x in 0..10 {
+                    let inside = (2..6).contains(&x) && (3..5).contains(&y);
+                    assert_eq!(dst[y * 10 + x] != 0, inside, "({x}, {y})");
+                }
+            }
+        }
     }
 }
