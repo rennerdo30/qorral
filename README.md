@@ -23,7 +23,7 @@ The time from a guest frame reaching Qorral to that frame being on screen, measu
 
 The targets are under 10 ms always, under 5 ms typically, and 1 ms as the stretch goal. Every path stays under 10 ms. The slowest frames come from the guest's own GPU work competing for the GPU. QEMU adds about 0.5–0.7 ms from the guest's flip to Qorral, and input reaches the guest in about 0.2 ms.
 
-End to end, a key press currently takes about 32 ms to show. Most of that is the guest's graphics driver, which presents frames only on a fixed 60 Hz tick. Removing that wait is the next step.
+End to end, a key press currently takes about 15 ms to show (median; Windows 11 guest with our guest display driver changes, which are not released yet). Nearly all of it is inside the guest: the application picks up the key at its next frame, then its present and the desktop compositor's present each spend about 3 ms in the guest's Direct3D 11 driver before the frame is flipped. From the flip to Qorral takes under 1 ms. Shortening those presents is the next step.
 
 ## Try it
 
