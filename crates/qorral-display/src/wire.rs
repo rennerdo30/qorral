@@ -163,6 +163,15 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
+    /// `au`.
+    pub fn u32s(&mut self) -> Result<Vec<u32>, Malformed> {
+        let n = self.u32()? as usize;
+        if !n.is_multiple_of(4) {
+            return Err(Malformed("array of u32 with a partial element"));
+        }
+        let bytes = self.take(n)?;
+        Ok(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
+    }
     /// Skips one value of a basic type or a string array (enough for header fields and the
     /// simple property values QEMU sends).
     pub fn skip(&mut self, sig: &str) -> Result<(), Malformed> {

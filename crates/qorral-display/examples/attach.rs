@@ -89,6 +89,7 @@ fn main() {
                 height,
                 stride,
                 format,
+                image,
                 ..
             }) => {
                 println!(
@@ -97,6 +98,7 @@ fn main() {
                     if dedicated { " dedicated" } else { "" },
                     device_uuid.iter().map(|b| format!("{b:02x}")).collect::<String>()
                 );
+                println!("           image: {image:?}");
                 close(handle);
             }
             Some(Event::FlipBlob { resource_id, .. }) => {

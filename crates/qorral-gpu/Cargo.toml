@@ -1,0 +1,15 @@
+[package]
+name = "qorral-gpu"
+description = "Qorral's Vulkan compositor: guest scanouts shown straight from their GPU memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = "0.38.0"
+
+[dev-dependencies]
+qorral-display = { path = "../qorral-display" }
+png = "0.18.1"

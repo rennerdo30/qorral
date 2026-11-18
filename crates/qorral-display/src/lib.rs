@@ -19,7 +19,7 @@ pub mod wire;
 mod sock;
 
 pub use conn::Error;
-pub use listener::{Caps, Event};
+pub use listener::{BlobImage, Caps, Event};
 #[cfg(windows)]
 pub use sock::SharedMap;
 

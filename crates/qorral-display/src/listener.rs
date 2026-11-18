@@ -89,6 +89,9 @@ pub enum Event<'a> {
         height: u32,
         stride: u32,
         format: u32,
+        /// The dedicated image the memory belongs to, as the host driver created it, if known.
+        /// The driver may compress image memory: read it through an identical image.
+        image: Option<BlobImage>,
     },
     /// Buffer `resource_id` is shown now; the rectangle changed. 0: blob scanouts ended, the
     /// other events carry the display again.
@@ -101,6 +104,63 @@ pub enum Event<'a> {
     MouseSet { x: i32, y: i32, visible: bool },
     /// A new pointer image: `width * height` 32-bit pixels.
     CursorDefine { width: i32, height: i32, hot_x: i32, hot_y: i32, data: &'a [u8] },
+}
+
+/// A guest image exactly as the host driver created it (Vulkan enum and flag values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobImage {
+    pub flags: u32,
+    pub image_type: u32,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub samples: u32,
+    pub tiling: u32,
+    pub usage: u32,
+    pub sharing_mode: u32,
+    pub handle_types: u32,
+}
+
+impl BlobImage {
+    fn from_words(w: &[u32]) -> Option<BlobImage> {
+        let &[
+            flags,
+            image_type,
+            format,
+            width,
+            height,
+            depth,
+            mip_levels,
+            array_layers,
+            samples,
+            tiling,
+            usage,
+            sharing_mode,
+            handle_types,
+            ..,
+        ] = w
+        else {
+            return None;
+        };
+        Some(BlobImage {
+            flags,
+            image_type,
+            format,
+            width,
+            height,
+            depth,
+            mip_levels,
+            array_layers,
+            samples,
+            tiling,
+            usage,
+            sharing_mode,
+            handle_types,
+        })
+    }
 }
 
 /// Handles one message received on the listener connection: calls `on_event` for display calls
@@ -213,7 +273,7 @@ fn dispatch(call: &Message, caps: Caps, on_event: &mut dyn FnMut(Event<'_>)) -> 
             width: r.u32().map_err(bad)?,
             height: r.u32().map_err(bad)?,
         },
-        (WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu") if caps.vulkan => {
+        (WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuuau") if caps.vulkan => {
             let uuid = |r: &mut Reader<'_>| -> Result<[u8; 16], CallError> {
                 r.bytes().map_err(bad)?.try_into().map_err(|_| INVALID_ARGS)
             };
@@ -230,6 +290,7 @@ fn dispatch(call: &Message, caps: Caps, on_event: &mut dyn FnMut(Event<'_>)) -> 
                 height: r.u32().map_err(bad)?,
                 stride: r.u32().map_err(bad)?,
                 format: r.u32().map_err(bad)?,
+                image: BlobImage::from_words(&r.u32s().map_err(bad)?),
             }
         }
         (WIN32_VULKAN, "FlipBlob", "uiiii") if caps.vulkan => Event::FlipBlob {
@@ -329,7 +390,7 @@ mod tests {
     #[test]
     fn zero_copy_blob_calls_become_events() {
         let caps = Caps { vulkan: true, ..Caps::default() };
-        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu", |w| {
+        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuuau", |w| {
             w.u32(7);
             w.u64(0xabc);
             w.u64(16 << 20);
@@ -342,19 +403,21 @@ mod tests {
             w.u32(800);
             w.u32(5120);
             w.u32(0x2002_0888);
+            w.array(4, |w| (1..=13).for_each(|v| w.u32(v)));
         });
         let mut got = None;
         handle(&m, caps, &mut |e| got = Some(format!("{e:?}")));
         let got = got.expect("an event");
         assert!(got.starts_with("ScanoutBlob { resource_id: 7, handle: 2748, allocation_size: 16777216, memory_type_index: 3, dedicated: true"));
-        assert!(got.ends_with("offset: 4096, width: 1280, height: 800, stride: 5120, format: 537004168 }"));
+        assert!(got.contains("offset: 4096, width: 1280, height: 800, stride: 5120, format: 537004168"));
+        assert!(got.contains("image: Some(BlobImage { flags: 1, image_type: 2, format: 3"), "{got}");
         let m = call(WIN32_VULKAN, "FlipBlob", "uiiii", |w| {
             w.u32(7);
             (0..4).for_each(|i| w.i32(i));
         });
         handle(&m, caps, &mut |e| assert_eq!(e, Event::FlipBlob { resource_id: 7, x: 0, y: 1, width: 2, height: 3 }));
         // A UUID of the wrong length is refused.
-        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu", |w| {
+        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuuau", |w| {
             w.u32(7);
             w.u64(1);
             w.u64(1);
