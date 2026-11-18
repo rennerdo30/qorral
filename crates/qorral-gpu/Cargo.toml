@@ -13,3 +13,6 @@ ash = "0.38.0"
 [dev-dependencies]
 qorral-display = { path = "../qorral-display" }
 png = "0.18.1"
+# The live viewer example only (already used by the app).
+winit = "0.30.13"
+raw-window-handle = "0.6.2"

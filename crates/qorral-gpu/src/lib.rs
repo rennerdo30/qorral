@@ -82,6 +82,35 @@ pub struct ImageParams {
     pub sharing_mode: u32,
 }
 
+/// A native window to present into (Windows: `HWND` and `HINSTANCE`).
+#[derive(Debug, Clone, Copy)]
+pub struct NativeWindow {
+    pub hwnd: isize,
+    pub hinstance: isize,
+}
+
+/// How presented frames reach the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Lowest latency: no wait for the display's refresh (may tear).
+    Immediate,
+    /// No tearing, no queue: the newest frame replaces a waiting one.
+    Mailbox,
+    /// Waits for the display's refresh.
+    Fifo,
+}
+
+/// What one [`Compositor::present`] took.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PresentTiming {
+    /// Waiting for a swapchain image.
+    pub acquire: Duration,
+    /// Recording, submitting and the GPU finishing the frame.
+    pub gpu: Duration,
+    /// The present call itself.
+    pub present: Duration,
+}
+
 /// The guest memory to import (from `ScanoutBlob`).
 #[derive(Debug, Clone, Copy)]
 pub struct GuestMemory {
@@ -119,6 +148,7 @@ pub struct Compositor {
     _entry: ash::Entry,
     instance: ash::Instance,
     device: ash::Device,
+    physical: vk::PhysicalDevice,
     queue: vk::Queue,
     queue_family: u32,
     queue_families: Vec<u32>,
@@ -128,6 +158,8 @@ pub struct Compositor {
     pool: vk::DescriptorPool,
     sampler: vk::Sampler,
     render_pass: vk::RenderPass,
+    /// The same pass ending in PRESENT_SRC, for the window.
+    present_pass: vk::RenderPass,
     image_pipe: Pipeline,
     buffer_pipe: Pipeline,
     commands: vk::CommandPool,
@@ -135,7 +167,22 @@ pub struct Compositor {
     fence: vk::Fence,
 
     target: Target,
+    window: Option<Window>,
     guests: HashMap<u32, Guest>,
+}
+
+/// A window target: surface, swapchain and its framebuffers.
+struct Window {
+    surface_fn: ash::khr::surface::Instance,
+    swapchain_fn: ash::khr::swapchain::Device,
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    mode: vk::PresentModeKHR,
+    extent: vk::Extent2D,
+    views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    acquired: vk::Semaphore,
+    rendered: vk::Semaphore,
 }
 
 /// The offscreen target and its readback buffer.
@@ -160,14 +207,40 @@ impl Compositor {
     /// Opens the GPU whose `deviceUUID` is `device_uuid` (the one the guest renders on: imports
     /// only work there) and prepares an offscreen target of `width` x `height`.
     pub fn new(device_uuid: &[u8; 16], width: u32, height: u32) -> Result<Compositor, Error> {
+        Self::open(device_uuid, width, height, None)
+    }
+
+    /// Like [`Compositor::new`], and presents into `window` (initially `width` x `height`
+    /// pixels) with the lowest-latency mode available from `prefer`.
+    pub fn for_window(
+        device_uuid: &[u8; 16],
+        window: NativeWindow,
+        width: u32,
+        height: u32,
+        prefer: PresentMode,
+    ) -> Result<Compositor, Error> {
+        let mut c = Self::open(device_uuid, width, height, Some(window))?;
+        c.create_window(window, width, height, prefer)?;
+        Ok(c)
+    }
+
+    fn open(
+        device_uuid: &[u8; 16],
+        width: u32,
+        height: u32,
+        window: Option<NativeWindow>,
+    ) -> Result<Compositor, Error> {
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Load(e.to_string()))?;
         let app = vk::ApplicationInfo::default().application_name(c"qorral").api_version(vk::API_VERSION_1_1);
+        let exts = [ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
+        let mut info = vk::InstanceCreateInfo::default().application_info(&app);
+        if window.is_some() {
+            info = info.enabled_extension_names(&exts);
+        }
         // SAFETY: valid create info; the instance is destroyed in Drop.
-        let instance =
-            unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
-                .map_err(vkr("vkCreateInstance"))?;
-        match Self::with_instance(entry, instance.clone(), device_uuid, width, height) {
+        let instance = unsafe { entry.create_instance(&info, None) }.map_err(vkr("vkCreateInstance"))?;
+        match Self::with_instance(entry, instance.clone(), device_uuid, width, height, window.is_some()) {
             Ok(c) => Ok(c),
             Err(e) => {
                 // SAFETY: nothing else uses the instance.
@@ -183,6 +256,7 @@ impl Compositor {
         device_uuid: &[u8; 16],
         width: u32,
         height: u32,
+        windowed: bool,
     ) -> Result<Compositor, Error> {
         // SAFETY: plain queries on a live instance.
         let physicals = unsafe { instance.enumerate_physical_devices() }.map_err(vkr("enumerate devices"))?;
@@ -214,7 +288,10 @@ impl Compositor {
         if !has(ash::khr::external_memory_win32::NAME) {
             return Err(Error::Unsupported(format!("{device_name} cannot import Win32 memory handles")));
         }
-        let ext_names = [ash::khr::external_memory_win32::NAME.as_ptr()];
+        let mut ext_names = vec![ash::khr::external_memory_win32::NAME.as_ptr()];
+        if windowed {
+            ext_names.push(ash::khr::swapchain::NAME.as_ptr());
+        }
         let prio = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
         let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&ext_names);
@@ -227,6 +304,7 @@ impl Compositor {
             _entry: entry,
             instance,
             device,
+            physical,
             queue,
             queue_family,
             queue_families: (0..families.len() as u32).collect(),
@@ -235,6 +313,7 @@ impl Compositor {
             pool: vk::DescriptorPool::null(),
             sampler: vk::Sampler::null(),
             render_pass: vk::RenderPass::null(),
+            present_pass: vk::RenderPass::null(),
             image_pipe: NULL_PIPE,
             buffer_pipe: NULL_PIPE,
             commands: vk::CommandPool::null(),
@@ -250,6 +329,7 @@ impl Compositor {
                 readback: vk::Buffer::null(),
                 readback_memory: vk::DeviceMemory::null(),
             },
+            window: None,
             guests: HashMap::new(),
         };
         // From here Drop cleans up whatever was created.
@@ -314,6 +394,13 @@ impl Compositor {
                     None,
                 )
                 .map_err(vkr("render pass"))?;
+            let present_attachments = [attachments[0].final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+            self.present_pass = d
+                .create_render_pass(
+                    &vk::RenderPassCreateInfo::default().attachments(&present_attachments).subpasses(&subpasses),
+                    None,
+                )
+                .map_err(vkr("present render pass"))?;
             self.commands = d
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
@@ -760,16 +847,21 @@ impl Compositor {
         self.guests.contains_key(&resource_id)
     }
 
-    /// Draws guest buffer `resource_id` into `dst` (x, y, w, h in target pixels, scaled when the
-    /// size differs) and waits for the GPU. With `readback`, the target is copied to host memory
-    /// for [`Compositor::pixels`]. Returns the time from submit to completion.
-    pub fn draw(&mut self, resource_id: u32, dst: [f32; 4], readback: bool) -> Result<Duration, Error> {
+    /// Records drawing guest buffer `resource_id` into `dst` of a render pass instance (into
+    /// the begun command buffer).
+    fn record(
+        &self,
+        resource_id: u32,
+        dst: [f32; 4],
+        pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+    ) -> Result<(), Error> {
         let g = self
             .guests
             .get(&resource_id)
             .ok_or_else(|| Error::Unsupported(format!("guest buffer {resource_id} not imported")))?;
         let d = &self.device;
-        let t = &self.target;
         let mut push = [0u8; PUSH_SIZE as usize];
         let put = |push: &mut [u8], at: usize, bytes: [u8; 4]| push[at..at + 4].copy_from_slice(&bytes);
         for (i, v) in dst.iter().enumerate() {
@@ -792,12 +884,6 @@ impl Compositor {
         };
         // SAFETY: one command buffer, recorded and waited for here; handles are live.
         unsafe {
-            d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).map_err(vkr("reset"))?;
-            d.begin_command_buffer(
-                self.cmd,
-                &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(vkr("begin"))?;
             match g {
                 Guest::Image { image, .. } => {
                     // Take the guest's image from the external queue (QEMU's renderer), keeping
@@ -872,11 +958,11 @@ impl Compositor {
             d.cmd_begin_render_pass(
                 self.cmd,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.render_pass)
-                    .framebuffer(t.framebuffer)
+                    .render_pass(pass)
+                    .framebuffer(framebuffer)
                     .render_area(vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D { width: t.width, height: t.height },
+                        extent: vk::Extent2D { width: extent.width, height: extent.height },
                     })
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
@@ -887,10 +973,10 @@ impl Compositor {
                 0,
                 &[vk::Viewport { x: dst[0], y: dst[1], width: dst[2], height: dst[3], min_depth: 0.0, max_depth: 1.0 }],
             );
-            let x0 = (dst[0].max(0.0) as u32).min(t.width);
-            let y0 = (dst[1].max(0.0) as u32).min(t.height);
-            let x1 = ((dst[0] + dst[2]).max(0.0) as u32).min(t.width);
-            let y1 = ((dst[1] + dst[3]).max(0.0) as u32).min(t.height);
+            let x0 = (dst[0].max(0.0) as u32).min(extent.width);
+            let y0 = (dst[1].max(0.0) as u32).min(extent.height);
+            let x1 = ((dst[0] + dst[2]).max(0.0) as u32).min(extent.width);
+            let y1 = ((dst[1] + dst[3]).max(0.0) as u32).min(extent.height);
             d.cmd_set_scissor(
                 self.cmd,
                 0,
@@ -903,6 +989,35 @@ impl Compositor {
             d.cmd_push_constants(self.cmd, pipe.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
             d.cmd_end_render_pass(self.cmd);
+        }
+        Ok(())
+    }
+
+    fn begin(&self) -> Result<(), Error> {
+        // SAFETY: the command buffer is not in use (every submit is waited for).
+        unsafe {
+            self.device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).map_err(vkr("reset"))?;
+            self.device
+                .begin_command_buffer(
+                    self.cmd,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(vkr("begin"))
+        }
+    }
+
+    /// Draws guest buffer `resource_id` into `dst` (x, y, w, h in target pixels, scaled when the
+    /// size differs) of the offscreen target and waits for the GPU. With `readback`, the target is
+    /// copied to host memory for [`Compositor::pixels`]. Returns the time from submit to
+    /// completion.
+    pub fn draw(&mut self, resource_id: u32, dst: [f32; 4], readback: bool) -> Result<Duration, Error> {
+        let t = &self.target;
+        let extent = vk::Extent2D { width: t.width, height: t.height };
+        self.begin()?;
+        self.record(resource_id, dst, self.render_pass, t.framebuffer, extent)?;
+        let d = &self.device;
+        // SAFETY: the command buffer was begun above; handles are live.
+        unsafe {
             if readback {
                 d.cmd_copy_image_to_buffer(
                     self.cmd,
@@ -934,6 +1049,227 @@ impl Compositor {
             d.reset_fences(&[self.fence]).map_err(vkr("reset fence"))?;
             Ok(took)
         }
+    }
+
+    fn create_window(&mut self, w: NativeWindow, width: u32, height: u32, prefer: PresentMode) -> Result<(), Error> {
+        let surface_fn = ash::khr::surface::Instance::new(&self._entry, &self.instance);
+        let win32_fn = ash::khr::win32_surface::Instance::new(&self._entry, &self.instance);
+        let swapchain_fn = ash::khr::swapchain::Device::new(&self.instance, &self.device);
+        // SAFETY: a live HWND and HINSTANCE from the caller; destroyed in Drop.
+        let surface = unsafe {
+            win32_fn.create_win32_surface(
+                &vk::Win32SurfaceCreateInfoKHR::default().hwnd(w.hwnd).hinstance(w.hinstance),
+                None,
+            )
+        }
+        .map_err(vkr("window surface"))?;
+        // SAFETY: queries on live objects.
+        let ok = unsafe { surface_fn.get_physical_device_surface_support(self.physical, self.queue_family, surface) };
+        let modes = unsafe { surface_fn.get_physical_device_surface_present_modes(self.physical, surface) };
+        let (Ok(true), Ok(modes)) = (ok, modes) else {
+            unsafe { surface_fn.destroy_surface(surface, None) };
+            return Err(Error::Unsupported(format!("{} cannot present to this window", self.device_name)));
+        };
+        let order: &[vk::PresentModeKHR] = match prefer {
+            PresentMode::Immediate => &[vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX],
+            PresentMode::Mailbox => &[vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::IMMEDIATE],
+            PresentMode::Fifo => &[],
+        };
+        let mode = order.iter().copied().find(|m| modes.contains(m)).unwrap_or(vk::PresentModeKHR::FIFO);
+        // SAFETY: plain semaphore creation; destroyed in Drop.
+        let (acquired, rendered) = unsafe {
+            (
+                self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(vkr("semaphore"))?,
+                self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(vkr("semaphore"))?,
+            )
+        };
+        self.window = Some(Window {
+            surface_fn,
+            swapchain_fn,
+            surface,
+            swapchain: vk::SwapchainKHR::null(),
+            mode,
+            extent: vk::Extent2D { width, height },
+            views: Vec::new(),
+            framebuffers: Vec::new(),
+            acquired,
+            rendered,
+        });
+        self.resize(width, height)
+    }
+
+    /// The present mode in use (the lowest-latency one the window offers).
+    pub fn present_mode(&self) -> Option<PresentMode> {
+        self.window.as_ref().map(|w| match w.mode {
+            vk::PresentModeKHR::IMMEDIATE => PresentMode::Immediate,
+            vk::PresentModeKHR::MAILBOX => PresentMode::Mailbox,
+            _ => PresentMode::Fifo,
+        })
+    }
+
+    /// (Re)creates the swapchain for a window of `width` x `height` pixels.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        let Some(w) = self.window.as_mut() else { return Ok(()) };
+        let d = &self.device;
+        // SAFETY: the GPU is idle (every frame is waited for); old objects are not in use.
+        unsafe {
+            let caps = w
+                .surface_fn
+                .get_physical_device_surface_capabilities(self.physical, w.surface)
+                .map_err(vkr("surface capabilities"))?;
+            let extent = if caps.current_extent.width != u32::MAX {
+                caps.current_extent
+            } else {
+                vk::Extent2D {
+                    width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+                    height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+                }
+            };
+            for f in w.framebuffers.drain(..) {
+                d.destroy_framebuffer(f, None);
+            }
+            for v in w.views.drain(..) {
+                d.destroy_image_view(v, None);
+            }
+            if extent.width == 0 || extent.height == 0 {
+                // Minimised: nothing to present into until it is restored.
+                w.extent = extent;
+                return Ok(());
+            }
+            let max = if caps.max_image_count == 0 { u32::MAX } else { caps.max_image_count };
+            let count = (caps.min_image_count + 1).min(max);
+            let old = w.swapchain;
+            w.swapchain = w
+                .swapchain_fn
+                .create_swapchain(
+                    &vk::SwapchainCreateInfoKHR::default()
+                        .surface(w.surface)
+                        .min_image_count(count)
+                        .image_format(FORMAT)
+                        .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                        .image_extent(extent)
+                        .image_array_layers(1)
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .pre_transform(caps.current_transform)
+                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .present_mode(w.mode)
+                        .clipped(true)
+                        .old_swapchain(old),
+                    None,
+                )
+                .map_err(vkr("swapchain"))?;
+            w.swapchain_fn.destroy_swapchain(old, None);
+            w.extent = extent;
+            for image in w.swapchain_fn.get_swapchain_images(w.swapchain).map_err(vkr("swapchain images"))? {
+                let view = d
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(FORMAT)
+                            .subresource_range(color_range()),
+                        None,
+                    )
+                    .map_err(vkr("swapchain view"))?;
+                w.views.push(view);
+                let views = [view];
+                w.framebuffers.push(
+                    d.create_framebuffer(
+                        &vk::FramebufferCreateInfo::default()
+                            .render_pass(self.present_pass)
+                            .attachments(&views)
+                            .width(extent.width)
+                            .height(extent.height)
+                            .layers(1),
+                        None,
+                    )
+                    .map_err(vkr("swapchain framebuffer"))?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The window's size in pixels as the swapchain sees it.
+    pub fn window_size(&self) -> (u32, u32) {
+        self.window.as_ref().map(|w| (w.extent.width, w.extent.height)).unwrap_or((0, 0))
+    }
+
+    /// Presents guest buffer `resource_id` into the window right away, fitted into `dst` (x, y,
+    /// w, h in window pixels), and waits until the GPU finished it (one frame in flight, none
+    /// queued). An out-of-date swapchain is recreated and the frame presented again.
+    pub fn present(&mut self, resource_id: u32, dst: [f32; 4]) -> Result<PresentTiming, Error> {
+        let mut timing = PresentTiming::default();
+        for attempt in 0..2 {
+            let Some(w) = self.window.as_ref() else {
+                return Err(Error::Unsupported("no window to present to".into()));
+            };
+            if w.extent.width == 0 || w.extent.height == 0 {
+                return Ok(timing);
+            }
+            let t0 = Instant::now();
+            // SAFETY: live swapchain and semaphore; the previous frame was waited for.
+            let acquired =
+                unsafe { w.swapchain_fn.acquire_next_image(w.swapchain, 1_000_000_000, w.acquired, vk::Fence::null()) };
+            let index = match acquired {
+                Ok((i, _)) => i,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) if attempt == 0 => {
+                    let (width, height) = (w.extent.width, w.extent.height);
+                    self.resize(width, height)?;
+                    continue;
+                }
+                Err(r) => return Err(Error::Vk("acquire", r)),
+            };
+            timing.acquire = t0.elapsed();
+            let t1 = Instant::now();
+            let (framebuffer, extent, acquired_sem, rendered_sem, swapchain) =
+                (w.framebuffers[index as usize], w.extent, w.acquired, w.rendered, w.swapchain);
+            self.begin()?;
+            self.record(resource_id, dst, self.present_pass, framebuffer, extent)?;
+            let d = &self.device;
+            let presented;
+            // SAFETY: the command buffer was begun above; handles are live.
+            unsafe {
+                d.end_command_buffer(self.cmd).map_err(vkr("end"))?;
+                let cmds = [self.cmd];
+                let waits = [acquired_sem];
+                let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+                let signals = [rendered_sem];
+                let submit = [vk::SubmitInfo::default()
+                    .wait_semaphores(&waits)
+                    .wait_dst_stage_mask(&stages)
+                    .command_buffers(&cmds)
+                    .signal_semaphores(&signals)];
+                d.queue_submit(self.queue, &submit, self.fence).map_err(vkr("submit"))?;
+                let t2 = Instant::now();
+                let swapchains = [swapchain];
+                let indices = [index];
+                presented = self.window.as_ref().map(|w| {
+                    w.swapchain_fn.queue_present(
+                        self.queue,
+                        &vk::PresentInfoKHR::default()
+                            .wait_semaphores(&signals)
+                            .swapchains(&swapchains)
+                            .image_indices(&indices),
+                    )
+                });
+                timing.present = t2.elapsed();
+                d.wait_for_fences(&[self.fence], true, 5_000_000_000).map_err(vkr("wait"))?;
+                d.reset_fences(&[self.fence]).map_err(vkr("reset fence"))?;
+            }
+            timing.gpu = t1.elapsed().saturating_sub(timing.present);
+            match presented {
+                Some(Ok(_)) | None => {}
+                Some(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)) => {
+                    let (width, height) = self.window_size();
+                    self.resize(width, height)?;
+                }
+                Some(Err(r)) => return Err(Error::Vk("present", r)),
+            }
+            return Ok(timing);
+        }
+        Ok(timing)
     }
 
     /// The target's pixels after a `draw(.., readback: true)`: rows of B, G, R, A bytes.
@@ -977,6 +1313,18 @@ impl Drop for Compositor {
             for id in ids {
                 self.forget(id);
             }
+            if let Some(mut w) = self.window.take() {
+                for f in w.framebuffers.drain(..) {
+                    self.device.destroy_framebuffer(f, None);
+                }
+                for v in w.views.drain(..) {
+                    self.device.destroy_image_view(v, None);
+                }
+                w.swapchain_fn.destroy_swapchain(w.swapchain, None);
+                w.surface_fn.destroy_surface(w.surface, None);
+                self.device.destroy_semaphore(w.acquired, None);
+                self.device.destroy_semaphore(w.rendered, None);
+            }
             self.destroy_pipeline(&self.image_pipe);
             self.destroy_pipeline(&self.buffer_pipe);
             let d = &self.device;
@@ -990,6 +1338,7 @@ impl Drop for Compositor {
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.commands, None);
             d.destroy_render_pass(self.render_pass, None);
+            d.destroy_render_pass(self.present_pass, None);
             d.destroy_sampler(self.sampler, None);
             d.destroy_descriptor_pool(self.pool, None);
             d.destroy_device(None);
