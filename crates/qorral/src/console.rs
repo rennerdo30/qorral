@@ -55,8 +55,11 @@ mod imp {
         live: bool,
         failed: bool,
         cursor_visible: Option<bool>,
-        /// QORRAL_TRACE: flip received to presented, per frame (ms).
+        /// QORRAL_TRACE: flip received to presented, per frame (ms), and that frame's parts
+        /// (acquire, GPU, present call).
         trace: Option<Vec<f32>>,
+        parts: Vec<[f32; 3]>,
+        last_timing: Option<qorral_gpu::PresentTiming>,
     }
 
     impl Shared {
@@ -95,7 +98,7 @@ mod imp {
                 self.bar_dirty = false;
             }
             let guest = (last != 0 && c.has(last)).then_some(last);
-            let _ = c.present(guest, dst);
+            self.last_timing = c.present(guest, dst).ok();
         }
     }
 
@@ -134,6 +137,8 @@ mod imp {
                 live: false,
                 cursor_visible: None,
                 trace: std::env::var_os("QORRAL_TRACE").map(|_| Vec::with_capacity(300)),
+                parts: Vec::new(),
+                last_timing: None,
                 failed: false,
             }));
             let (sh, id_owned) = (shared.clone(), id.to_string());
@@ -361,9 +366,30 @@ mod imp {
                     s.present();
                     if resource_id != 0 && s.comp.is_some() {
                         let (w, h) = s.guest;
-                        if let Some(t) = s.trace.as_mut() {
+                        // Reborrow out of the guard so the fields borrow separately.
+                        let sh = &mut *s;
+                        if let Some(t) = sh.trace.as_mut() {
+                            if let Some(p) = sh.last_timing {
+                                sh.parts.push([
+                                    p.acquire.as_secs_f32() * 1e3,
+                                    p.gpu.as_secs_f32() * 1e3,
+                                    p.present.as_secs_f32() * 1e3,
+                                ]);
+                            }
                             t.push(t0.elapsed().as_secs_f32() * 1000.0);
                             if t.len() >= 300 {
+                                let parts = std::mem::take(&mut sh.parts);
+                                let med = |i: usize| {
+                                    let mut v: Vec<f32> = parts.iter().map(|p| p[i]).collect();
+                                    v.sort_by(f32::total_cmp);
+                                    v.get(v.len() / 2).copied().unwrap_or(0.0)
+                                };
+                                eprintln!(
+                                    "qorral: console {id}: medians acquire {:.3} ms, record + GPU {:.3} ms, present call {:.3} ms",
+                                    med(0),
+                                    med(1),
+                                    med(2)
+                                );
                                 t.sort_by(f32::total_cmp);
                                 eprintln!(
                                     "qorral: console {id} {w}x{h}: flip received to presented over {} frames: median {:.3} ms, p99 {:.3} ms, max {:.3} ms",
