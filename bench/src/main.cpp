@@ -331,8 +331,22 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
     std::string latencySource;
 
     auto seconds = [](clock::duration d) { return std::chrono::duration<double>(d).count(); };
+    auto pumpEvents = [&] {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) aborted = true;
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) aborted = true;
+            else if ((ev.type == SDL_KEYDOWN && !ev.key.repeat) || ev.type == SDL_MOUSEBUTTONDOWN) ++inputs;
+            if (ev.type == SDL_WINDOWEVENT && (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                                               ev.window.event == SDL_WINDOWEVENT_RESIZED))
+                needRecreate = !o.offscreen;
+        }
+    };
     auto frame = [&](double t, float dt, bool measured, const std::string* capture) {
         if (!dev.beginFrame(measured)) return true;
+        // The latency scene reads input once more after the frame's image is acquired: acquire can
+        // wait for a whole display cycle, and input from that wait belongs in this frame.
+        if (scene->closedLoop()) pumpEvents();
         scene->record(dev, FrameInfo{dev.frameSlot(), t, dt, inputs});
         const bool recreate = dev.endFrame(capture);
         if (scene->closedLoop()) {
@@ -347,15 +361,7 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
     };
 
     while (!aborted) {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) aborted = true;
-            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) aborted = true;
-            else if ((ev.type == SDL_KEYDOWN && !ev.key.repeat) || ev.type == SDL_MOUSEBUTTONDOWN) ++inputs;
-            if (ev.type == SDL_WINDOWEVENT && (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
-                                               ev.window.event == SDL_WINDOWEVENT_RESIZED))
-                needRecreate = !o.offscreen;
-        }
+        pumpEvents();
         if (aborted) break;
         const auto now = clock::now();
         const double t = seconds(now - start);
