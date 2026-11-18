@@ -79,6 +79,9 @@ pub struct Launch<'a> {
     pub accel: &'a str,
     /// UEFI firmware code (read-only), e.g. `share/edk2-x86_64-code.fd`.
     pub firmware_code: Option<&'a Path>,
+    /// The refresh rate (mHz) the guest's display reports in its EDID: the host monitors'
+    /// highest, so a guest driver that follows it paces at least that fast.
+    pub refresh_mhz: Option<u32>,
 }
 
 /// The arguments after the executable. QEMU opens a window only when
@@ -158,7 +161,11 @@ pub fn args(l: &Launch) -> Vec<String> {
         (Display::Headless, true) => "egl-headless",
         (Display::Headless, false) => "none",
     };
-    push(&["-display", display]);
+    let display = match l.refresh_mhz {
+        Some(mhz) if display.starts_with("dbus") => format!("{display},refresh-rate={mhz}"),
+        _ => display.to_string(),
+    };
+    push(&["-display", &display]);
     if vm.firmware == Firmware::Uefi
         && let Some(code) = l.firmware_code
     {
@@ -218,6 +225,7 @@ mod tests {
             display,
             accel: "whpx",
             firmware_code: Some(&fw),
+            refresh_mhz: None,
         })
     }
 
@@ -237,6 +245,28 @@ mod tests {
         assert!(a.iter().any(|s| s == "-no-reboot"));
         assert!(a.iter().any(|s| s.starts_with("if=pflash,format=qcow2,file=")));
         assert!(has_pair(&a, "-qmp", "tcp:127.0.0.1:44400,server=on,wait=off"));
+    }
+
+    #[test]
+    fn the_dbus_display_carries_the_host_refresh_rate() {
+        let vm = VmConfig { gpu: GpuMode::Vulkan, ..VmConfig::default() };
+        let paths = VmPaths::in_dir(Path::new("/vms/a"));
+        let l = |display, refresh_mhz| Launch {
+            vm: &vm,
+            paths: &paths,
+            ports: Ports { qmp: 1, agent: 2 },
+            display,
+            accel: "whpx",
+            firmware_code: None,
+            refresh_mhz,
+        };
+        if cfg!(windows) {
+            let a = args(&l(Display::Headless, Some(165_000)));
+            assert!(has_pair(&a, "-display", "dbus,p2p=yes,gl=on,refresh-rate=165000"));
+            assert!(has_pair(&args(&l(Display::Headless, None)), "-display", "dbus,p2p=yes,gl=on"));
+        }
+        // SDL reads its own monitor's rate: no option there.
+        assert!(has_pair(&args(&l(Display::Window, Some(165_000))), "-display", "sdl,gl=on"));
     }
 
     #[test]
@@ -317,6 +347,7 @@ mod tests {
             display: Display::Headless,
             accel: "whpx",
             firmware_code: None,
+            refresh_mhz: None,
         });
         let dev = a.iter().find(|x| x.starts_with("virtio-fs-host-pci")).expect("device");
         assert!(dev.starts_with("virtio-fs-host-pci,tag=qorral,config="), "{dev}");

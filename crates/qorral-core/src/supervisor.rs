@@ -222,8 +222,15 @@ pub fn start(lib: &Library, q: &QemuInstall, entry: &VmEntry, o: &StartOptions) 
     if config.firmware == Firmware::Uefi && fw.is_none() {
         return Err("the QEMU build has no UEFI firmware (share/edk2-x86_64-code.fd)".into());
     }
-    let launch =
-        Launch { vm: &config, paths: &paths, ports, display, accel: qemu::host_accel(), firmware_code: fw.as_deref() };
+    let launch = Launch {
+        vm: &config,
+        paths: &paths,
+        ports,
+        display,
+        accel: qemu::host_accel(),
+        firmware_code: fw.as_deref(),
+        refresh_mhz: crate::host::max_refresh_hz().map(|hz| hz * 1000),
+    };
     let args = qemu::args(&launch);
     let log_path = entry.dir.join("qemu.log");
     let mut log = std::fs::File::create(&log_path).map_err(|e| format!("cannot write qemu.log: {e}"))?;
@@ -394,6 +401,7 @@ pub fn command_line(q: Option<&QemuInstall>, entry: &VmEntry) -> String {
         display: Display::Headless,
         accel: qemu::host_accel(),
         firmware_code: fw.as_deref(),
+        refresh_mhz: crate::host::max_refresh_hz().map(|hz| hz * 1000),
     };
     let exe = q.map_or("qemu-system-x86_64".to_string(), |q| q.system().display().to_string());
     let quote = |s: &str| if s.contains(' ') { format!("\"{s}\"") } else { s.to_string() };

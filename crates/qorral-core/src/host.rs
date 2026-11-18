@@ -102,6 +102,50 @@ impl QemuInstall {
     }
 }
 
+/// The refresh rate (Hz) a guest display reports: `QORRAL_REFRESH_HZ` when set, else the highest
+/// among the monitors attached to the desktop, if known.
+pub fn max_refresh_hz() -> Option<u32> {
+    std::env::var("QORRAL_REFRESH_HZ")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|hz| (24..=1000).contains(hz))
+        .or_else(monitor_refresh_hz)
+}
+
+#[cfg(windows)]
+fn monitor_refresh_hz() -> Option<u32> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW,
+        EnumDisplaySettingsW,
+    };
+    let mut best = None;
+    for i in 0.. {
+        // SAFETY: zeroed out-structs with their size set, as the API requires.
+        let mut dev: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        dev.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        if unsafe { EnumDisplayDevicesW(std::ptr::null(), i, &mut dev, 0) } == 0 {
+            break;
+        }
+        if dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP == 0 {
+            continue;
+        }
+        let mut mode: DEVMODEW = unsafe { std::mem::zeroed() };
+        mode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        // SAFETY: the device name comes from EnumDisplayDevicesW (null-terminated).
+        if unsafe { EnumDisplaySettingsW(dev.DeviceName.as_ptr(), ENUM_CURRENT_SETTINGS, &mut mode) } != 0
+            && mode.dmDisplayFrequency > 1
+        {
+            best = best.max(Some(mode.dmDisplayFrequency));
+        }
+    }
+    best
+}
+
+#[cfg(not(windows))]
+fn monitor_refresh_hz() -> Option<u32> {
+    None
+}
+
 pub fn parse_version(text: &str) -> Option<String> {
     let line = text.lines().find(|l| l.contains("version"))?;
     line.split_whitespace().skip_while(|w| *w != "version").nth(1).map(|v| v.trim_end_matches(',').to_string())
