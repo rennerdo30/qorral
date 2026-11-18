@@ -73,6 +73,7 @@ Sandbox ids work with every machine command (info, exec, screenshot, keys, stop)
 exit codes: 0 done, 1 failed, 2 usage error, 3 no such machine, 4 timed out
 ";
 
+#[derive(Debug)]
 struct Opts {
     json: bool,
     rest: Vec<String>,
@@ -107,6 +108,9 @@ const VALUED: &[&str] = &[
     "--interval",
 ];
 
+/// Options without a value.
+const SWITCHES: &[&str] = &["--bios", "--force", "--nvme", "--readonly", "--window", "--yes"];
+
 fn parse(args: Vec<String>) -> Result<Opts, String> {
     let mut o = Opts { json: false, rest: Vec::new(), flags: Vec::new(), tail: Vec::new() };
     let mut it = args.into_iter();
@@ -120,7 +124,14 @@ fn parse(args: Vec<String>) -> Result<Opts, String> {
             let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
             o.flags.push((a, Some(v)));
         } else if a.starts_with("--") {
-            o.flags.push((a, None));
+            // `--name=value` is the same as `--name value`; anything unknown is a usage error,
+            // never silently ignored.
+            match a.split_once('=') {
+                Some((name, v)) if VALUED.contains(&name) => o.flags.push((name.to_string(), Some(v.to_string()))),
+                Some((name, _)) if SWITCHES.contains(&name) => return Err(format!("{name} takes no value")),
+                None if SWITCHES.contains(&a.as_str()) => o.flags.push((a, None)),
+                _ => return Err(format!("unknown option `{a}` (see `qorral help`)")),
+            }
         } else {
             o.rest.push(a);
         }
@@ -1208,5 +1219,19 @@ mod tests {
         assert_eq!(o.val("--timeout"), Some("5"));
         assert_eq!(o.tail, ["cmd", "/c", "--json", "ver"]);
         assert!(!o.json, "--json after -- belongs to the guest command");
+    }
+
+    #[test]
+    fn name_equals_value_works_and_unknown_options_are_refused() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse(args(&["vm", "--qemu-arg=-d", "--qemu-arg", "guest_errors", "--minutes=5", "--force"])).unwrap();
+        assert_eq!(o.vals("--qemu-arg"), ["-d", "guest_errors"]);
+        assert_eq!(o.val("--minutes"), Some("5"));
+        assert!(o.flag("--force"));
+        // A value may itself contain `=`.
+        assert_eq!(parse(args(&["--qemu-arg=-global=x.y=1"])).unwrap().vals("--qemu-arg"), ["-global=x.y=1"]);
+        assert!(parse(args(&["vm", "--qemu-args", "x"])).unwrap_err().contains("unknown option `--qemu-args`"));
+        assert!(parse(args(&["vm", "--force=yes"])).unwrap_err().contains("takes no value"));
+        assert!(parse(args(&["vm", "--minutes="])).unwrap().val("--minutes") == Some(""));
     }
 }
