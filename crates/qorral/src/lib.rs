@@ -60,6 +60,8 @@ pub struct GuiArgs {
     pub console: bool,
     /// Open this machine's console (id or name) as soon as it runs.
     pub open: Option<String>,
+    /// Open this machine's console (id or name) in its own window as soon as it runs.
+    pub popout: Option<String>,
 }
 
 pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, String> {
@@ -84,6 +86,7 @@ pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, Str
             "--details" => a.details = true,
             "--console" => a.console = true,
             "--open" => a.open = Some(val("--open")?),
+            "--popout" => a.popout = Some(val("--popout")?),
             "--hover" => {
                 let v = val("--hover")?;
                 let (x, y) = v.split_once(',').ok_or("--hover is X,Y")?;

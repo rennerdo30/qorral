@@ -20,9 +20,9 @@ pub enum ConsoleEvent {
     /// QEMU closed the display connection (the machine stopped).
     Disconnected(String),
     /// The guest's pointer image: RGBA rows, size, hotspot.
-    Cursor { rgba: Vec<u8>, width: u16, height: u16, hot_x: u16, hot_y: u16 },
+    Cursor { id: String, rgba: Vec<u8>, width: u16, height: u16, hot_x: u16, hot_y: u16 },
     /// The guest shows or hides its pointer.
-    CursorVisible(bool),
+    CursorVisible(String, bool),
 }
 
 #[cfg(windows)]
@@ -105,6 +105,8 @@ mod imp {
         held: BTreeSet<u32>,
         /// The pointer is over the guest.
         inside: bool,
+        /// The mouse is captured: relative motion only, every button to the guest.
+        captured: bool,
     }
 
     impl Console {
@@ -136,7 +138,7 @@ mod imp {
                 let r = attach(&root, &id_owned, sh, notify.clone());
                 notify(ConsoleEvent::Attached(id_owned, r));
             });
-            Console { id: id.to_string(), shared, display: None, held: BTreeSet::new(), inside: false }
+            Console { id: id.to_string(), shared, display: None, held: BTreeSet::new(), inside: false, captured: false }
         }
 
         pub fn set_display(&mut self, d: Display) {
@@ -182,8 +184,30 @@ mod imp {
             self.inside
         }
 
+        /// Captures the mouse (relative motion, every button to the guest) or releases it.
+        pub fn set_captured(&mut self, on: bool) {
+            self.captured = on;
+        }
+
+        /// Relative motion while the mouse is captured.
+        pub fn mouse_by(&self, dx: i32, dy: i32) {
+            if let (true, Some(d)) = (self.captured, &self.display) {
+                let _ = d.mouse_by(dx, dy);
+            }
+        }
+
+        /// Presents the last frame again (after a resize while the guest shows nothing new).
+        pub fn redraw(&self) {
+            if let Ok(mut s) = self.shared.lock() {
+                s.present();
+            }
+        }
+
         /// The pointer moved; returns whether it is over the guest.
         pub fn pointer(&mut self, x: f64, y: f64) -> bool {
+            if self.captured {
+                return true; // relative motion only while captured
+            }
             let p = self.guest_point(x, y);
             self.inside = p.is_some();
             if let (Some(d), Some((gx, gy))) = (&self.display, p) {
@@ -194,7 +218,7 @@ mod imp {
 
         /// A mouse button over the guest: sent, and true. Elsewhere: false (the UI's).
         pub fn button(&self, b: Button, down: bool) -> bool {
-            if !self.inside {
+            if !self.inside && !self.captured {
                 return false;
             }
             if let Some(d) = &self.display {
@@ -204,7 +228,7 @@ mod imp {
         }
 
         pub fn wheel(&self, up: bool) {
-            if let (true, Some(d)) = (self.inside, &self.display) {
+            if let (true, Some(d)) = (self.inside || self.captured, &self.display) {
                 let b = if up { Button::WheelUp } else { Button::WheelDown };
                 let _ = d.button(b, true);
                 let _ = d.button(b, false);
@@ -352,6 +376,7 @@ mod imp {
                             .flat_map(|p| [p[2], p[1], p[0], p[3]])
                             .collect();
                         notify(ConsoleEvent::Cursor {
+                            id: id.clone(),
                             rgba,
                             width: w as u16,
                             height: h as u16,
@@ -362,7 +387,7 @@ mod imp {
                 }
                 Some(Event::MouseSet { visible, .. }) if s.cursor_visible != Some(visible) => {
                     s.cursor_visible = Some(visible);
-                    notify(ConsoleEvent::CursorVisible(visible));
+                    notify(ConsoleEvent::CursorVisible(id.clone(), visible));
                 }
                 None => notify(ConsoleEvent::Disconnected(id.clone())),
                 _ => {}

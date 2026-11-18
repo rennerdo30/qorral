@@ -59,6 +59,8 @@ struct App {
     t0: Instant,
     /// `--open`: the machine whose console to show once it runs.
     open: Option<String>,
+    /// `--popout`: the machine whose console window to open once it runs.
+    popout_arg: Option<String>,
     smoke: bool,
     smoke_reported: bool,
     ui: Option<Ui>,
@@ -81,10 +83,98 @@ struct App {
     console: Option<crate::console::Console>,
     /// The UI's pixels while a console is open (the compositor shows the title row from it).
     backing: Vec<u32>,
-    /// The guest's pointer (shown while the pointer is over the guest) and whether it shows.
-    guest_cursor: Option<winit::window::CustomCursor>,
-    guest_cursor_visible: bool,
-    over_guest: bool,
+    /// The guest's pointer in the main window's console.
+    gp: GuestPointer,
+    /// Consoles in their own windows.
+    #[cfg(windows)]
+    popouts: Vec<PopOut>,
+    /// Machines whose console should move into its own window (needs the event loop).
+    popout_requests: Vec<String>,
+}
+
+/// The pointer over a console: over the guest, captured, the guest's own pointer.
+struct GuestPointer {
+    over: bool,
+    captured: bool,
+    cursor: Option<winit::window::CustomCursor>,
+    visible: bool,
+}
+
+impl Default for GuestPointer {
+    fn default() -> Self {
+        GuestPointer { over: false, captured: false, cursor: None, visible: true }
+    }
+}
+
+impl GuestPointer {
+    /// Over the guest: the guest's pointer (or none when the guest hides it or the mouse is
+    /// captured); elsewhere the UI's (`hand` over clickable things).
+    fn apply(&self, window: &Window, hand: bool) {
+        if self.captured {
+            window.set_cursor_visible(false);
+        } else if self.over {
+            window.set_cursor_visible(self.visible);
+            match &self.cursor {
+                Some(c) => window.set_cursor(c.clone()),
+                None => window.set_cursor(CursorIcon::Default),
+            }
+        } else {
+            window.set_cursor_visible(true);
+            window.set_cursor(if hand { CursorIcon::Pointer } else { CursorIcon::Default });
+        }
+    }
+}
+
+/// Captures the mouse into `window` for `console` (games: relative motion), or releases it.
+#[cfg(windows)]
+fn set_capture(window: &Window, console: &mut crate::console::Console, gp: &mut GuestPointer, on: bool) {
+    use winit::window::CursorGrabMode;
+    if on {
+        if window.set_cursor_grab(CursorGrabMode::Confined).is_err() {
+            return;
+        }
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+    }
+    console.set_captured(on);
+    gp.captured = on;
+    gp.apply(window, false);
+}
+
+/// A host mouse button as the guest's (none for buttons the guest has no use for).
+#[cfg(windows)]
+fn guest_button(b: MouseButton) -> Option<qorral_display::Button> {
+    use qorral_display::Button as B;
+    Some(match b {
+        MouseButton::Left => B::Left,
+        MouseButton::Right => B::Right,
+        MouseButton::Middle => B::Middle,
+        MouseButton::Back => B::Side,
+        MouseButton::Forward => B::Extra,
+        MouseButton::Other(_) => return None,
+    })
+}
+
+#[cfg(windows)]
+fn wheel_up(d: &MouseScrollDelta) -> bool {
+    match d {
+        MouseScrollDelta::LineDelta(_, y) => *y > 0.0,
+        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+    }
+}
+
+/// Ctrl+Alt+G, the capture toggle (never sent to the guest).
+fn is_capture_key(mods: ModifiersState, event: &winit::event::KeyEvent) -> bool {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    mods.control_key() && mods.alt_key() && event.physical_key == PhysicalKey::Code(KeyCode::KeyG)
+}
+
+/// A machine's console in its own window: the guest fills it, the native frame around it.
+#[cfg(windows)]
+struct PopOut {
+    window: Rc<Window>,
+    console: crate::console::Console,
+    gp: GuestPointer,
 }
 
 pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
@@ -136,6 +226,7 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
     let mut app = App {
         t0,
         open: args.open.clone(),
+        popout_arg: args.popout.clone(),
         smoke: args.smoke,
         smoke_reported: false,
         ui: None,
@@ -155,9 +246,10 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         #[cfg(windows)]
         console: None,
         backing: Vec::new(),
-        guest_cursor: None,
-        guest_cursor_visible: true,
-        over_guest: false,
+        gp: GuestPointer::default(),
+        #[cfg(windows)]
+        popouts: Vec::new(),
+        popout_requests: Vec::new(),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("qorral: event loop failed: {e}");
@@ -294,7 +386,19 @@ impl App {
                     send(&p, UserEvent::Views(model::views(&lib, qemu.lock().ok().and_then(|g| g.clone()).as_ref())));
                 });
             }
-            Action::OpenConsole { id } => self.open_console(&id),
+            Action::OpenConsole { id } => {
+                // A machine shown in its own window: bring that window forward instead.
+                #[cfg(windows)]
+                if let Some(p) = self.popouts.iter().find(|p| p.console.id == id) {
+                    p.window.focus_window();
+                    if let Some(ui) = &mut self.ui {
+                        ui.close_console();
+                    }
+                    return;
+                }
+                self.open_console(&id)
+            }
+            Action::PopOutConsole { id } => self.popout_requests.push(id),
             Action::CloseConsole => self.close_console(),
             Action::SendCtrlAltDel { id } => {
                 #[cfg(windows)]
@@ -411,10 +515,17 @@ impl App {
 
     fn close_console(&mut self) {
         #[cfg(windows)]
+        if let (Some(g), Some(c)) = (&self.gfx, &mut self.console)
+            && self.gp.captured
+        {
+            set_capture(&g.window, c, &mut self.gp, false);
+        }
+        #[cfg(windows)]
         drop(self.console.take());
-        self.over_guest = false;
-        self.guest_cursor = None;
-        self.guest_cursor_visible = true;
+        self.gp = GuestPointer::default();
+        if let Some(ui) = &mut self.ui {
+            ui.set_mouse_captured(false);
+        }
         self.update_cursor();
         // The compositor drew the window: the CPU path repaints all of it.
         if let Some(ui) = &mut self.ui {
@@ -424,6 +535,31 @@ impl App {
 
     fn console_event(&mut self, ev: crate::console::ConsoleEvent) {
         use crate::console::ConsoleEvent as E;
+        // A console in its own window?
+        #[cfg(windows)]
+        {
+            let id = match &ev {
+                E::Attached(id, _) | E::Live(id) | E::Failed(id, _) | E::Disconnected(id) => id.clone(),
+                E::Cursor { id, .. } | E::CursorVisible(id, _) => id.clone(),
+            };
+            let main = self.console.as_ref().is_some_and(|c| c.id == id);
+            if !main && let Some(i) = self.popouts.iter().position(|p| p.console.id == id) {
+                match ev {
+                    E::Attached(_, Ok(d)) => self.popouts[i].console.set_display(d),
+                    E::Attached(_, Err(e)) | E::Failed(_, e) => {
+                        if let Some(ui) = &mut self.ui {
+                            ui.set_toast(Some(format!("The console window could not show the machine: {e}")));
+                        }
+                        self.popouts.remove(i);
+                    }
+                    E::Disconnected(_) => {
+                        self.popouts.remove(i);
+                    }
+                    E::Live(_) | E::Cursor { .. } | E::CursorVisible(..) => {}
+                }
+                return;
+            }
+        }
         let Some(ui) = &mut self.ui else { return };
         match ev {
             #[cfg(windows)]
@@ -451,7 +587,7 @@ impl App {
                     ui.close_console();
                 }
             }
-            E::Cursor { .. } | E::CursorVisible(_) => {}
+            E::Cursor { .. } | E::CursorVisible(..) => {}
         }
     }
 
@@ -510,6 +646,15 @@ impl App {
     }
 
     fn after_input(&mut self) {
+        // `--popout NAME`: once the machine runs, its console window opens.
+        if let (Some(key), Some(ui)) = (&self.popout_arg, &self.ui)
+            && let Some(v) = ui.vms.iter().find(|v| {
+                (v.id == *key || v.name.eq_ignore_ascii_case(key)) && matches!(v.state, RunState::Running { .. })
+            })
+        {
+            self.popout_requests.push(v.id.clone());
+            self.popout_arg = None;
+        }
         let win = self.ui.as_mut().and_then(|u| u.win_action.take());
         if let (Some(a), Some(g)) = (win, &self.gfx) {
             match a {
@@ -522,7 +667,7 @@ impl App {
             self.handle(a);
         }
         if let (Some(g), Some(ui)) = (&self.gfx, &self.ui) {
-            if !self.over_guest && ui.pointer_cursor_is_hand() != self.hand {
+            if !self.gp.over && ui.pointer_cursor_is_hand() != self.hand {
                 self.hand = ui.pointer_cursor_is_hand();
                 g.window.set_cursor(if self.hand { CursorIcon::Pointer } else { CursorIcon::Default });
             }
@@ -625,16 +770,115 @@ impl App {
     /// UI's.
     fn update_cursor(&mut self) {
         let Some(g) = &self.gfx else { return };
-        if self.over_guest && self.console_open() {
-            g.window.set_cursor_visible(self.guest_cursor_visible);
-            match &self.guest_cursor {
-                Some(c) => g.window.set_cursor(c.clone()),
-                None => g.window.set_cursor(CursorIcon::Default),
+        self.gp.apply(&g.window, self.hand);
+    }
+
+    /// Creates the windows for consoles that should pop out (needs the event loop).
+    #[cfg(windows)]
+    fn open_popouts(&mut self, el: &ActiveEventLoop) {
+        for id in std::mem::take(&mut self.popout_requests) {
+            if let Some(p) = self.popouts.iter().find(|p| p.console.id == id) {
+                p.window.focus_window();
+                continue;
             }
-        } else {
-            g.window.set_cursor_visible(true);
-            g.window.set_cursor(if self.hand { CursorIcon::Pointer } else { CursorIcon::Default });
+            let name = self
+                .ui
+                .as_ref()
+                .and_then(|u| u.vms.iter().find(|v| v.id == id).map(|v| v.name.clone()))
+                .unwrap_or_else(|| id.clone());
+            let attrs = Window::default_attributes()
+                .with_title(format!("{name} · Qorral"))
+                .with_inner_size(LogicalSize::new(1280.0, 800.0))
+                .with_min_inner_size(LogicalSize::new(320.0, 200.0));
+            let window = match el.create_window(attrs) {
+                Ok(w) => Rc::new(w),
+                Err(e) => {
+                    if let Some(ui) = &mut self.ui {
+                        ui.set_toast(Some(format!("Could not open a console window: {e}")));
+                    }
+                    continue;
+                }
+            };
+            let (hwnd, hinstance) = match raw_window_handle::HasWindowHandle::window_handle(&*window)
+                .map(|h| h.as_raw())
+            {
+                Ok(raw_window_handle::RawWindowHandle::Win32(h)) => (h.hwnd.get(), h.hinstance.map_or(0, |i| i.get())),
+                _ => continue,
+            };
+            platform::dark_title_bar(hwnd);
+            let sz = window.inner_size();
+            let p = self.proxy.clone();
+            let notify: crate::console::Notify = Arc::new(move |ev| send(&p, UserEvent::Console(ev)));
+            let console = crate::console::Console::open(
+                &id,
+                self.lib_root.clone(),
+                (hwnd, hinstance),
+                (sz.width, sz.height),
+                [0.0, 0.0, sz.width as f32, sz.height as f32],
+                notify,
+            );
+            self.popouts.push(PopOut { window, console, gp: GuestPointer::default() });
         }
+    }
+
+    /// Input and window events for a console window. Returns false if `id` is not one.
+    #[cfg(windows)]
+    fn popout_event(&mut self, id: WindowId, ev: &WindowEvent) -> bool {
+        let Some(i) = self.popouts.iter().position(|p| p.window.id() == id) else { return false };
+        let mods = self.mods;
+        let p = &mut self.popouts[i];
+        match ev {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                let mut p = self.popouts.remove(i);
+                if p.gp.captured {
+                    set_capture(&p.window, &mut p.console, &mut p.gp, false);
+                }
+                drop(p.console); // before its window: it presents into it
+            }
+            WindowEvent::Resized(sz) => {
+                p.console.resize((sz.width, sz.height), [0.0, 0.0, sz.width as f32, sz.height as f32]);
+                p.console.redraw();
+            }
+            WindowEvent::Focused(false) => {
+                p.console.release_keys();
+                if p.gp.captured {
+                    set_capture(&p.window, &mut p.console, &mut p.gp, false);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let inside = p.console.pointer(position.x, position.y);
+                if inside != p.gp.over {
+                    p.gp.over = inside;
+                    p.gp.apply(&p.window, false);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                p.gp.over = false;
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(b) = guest_button(*button) {
+                    p.console.button(b, *state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                p.console.wheel(wheel_up(delta));
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if is_capture_key(mods, event) {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        let on = !p.gp.captured;
+                        set_capture(&p.window, &mut p.console, &mut p.gp, on);
+                    }
+                } else {
+                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                    if let Some(sc) = event.physical_key.to_scancode() {
+                        p.console.key(sc, event.state == ElementState::Pressed);
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
     }
 
     fn console_open(&self) -> bool {
@@ -648,15 +892,7 @@ impl App {
     fn console_takes(&self, button: MouseButton, state: ElementState) -> bool {
         #[cfg(windows)]
         if let Some(c) = &self.console {
-            use qorral_display::Button as B;
-            let b = match button {
-                MouseButton::Left => B::Left,
-                MouseButton::Right => B::Right,
-                MouseButton::Middle => B::Middle,
-                MouseButton::Back => B::Side,
-                MouseButton::Forward => B::Extra,
-                MouseButton::Other(_) => return true,
-            };
+            let Some(b) = guest_button(button) else { return true };
             return c.button(b, state == ElementState::Pressed);
         }
         let _ = (button, state);
@@ -780,14 +1016,29 @@ impl ApplicationHandler<UserEvent> for App {
                 self.exit_code = 1;
                 el.exit();
             }
-            UserEvent::Console(crate::console::ConsoleEvent::Cursor { rgba, width, height, hot_x, hot_y }) => {
-                self.guest_cursor = winit::window::CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y)
+            UserEvent::Console(crate::console::ConsoleEvent::Cursor { id, rgba, width, height, hot_x, hot_y }) => {
+                let cursor = winit::window::CustomCursor::from_rgba(rgba, width, height, hot_x, hot_y)
                     .ok()
                     .map(|src| el.create_custom_cursor(src));
+                #[cfg(windows)]
+                if let Some(p) = self.popouts.iter_mut().find(|p| p.console.id == id) {
+                    p.gp.cursor = cursor;
+                    p.gp.apply(&p.window, false);
+                    return;
+                }
+                let _ = id;
+                self.gp.cursor = cursor;
                 self.update_cursor();
             }
-            UserEvent::Console(crate::console::ConsoleEvent::CursorVisible(v)) => {
-                self.guest_cursor_visible = v;
+            UserEvent::Console(crate::console::ConsoleEvent::CursorVisible(id, v)) => {
+                #[cfg(windows)]
+                if let Some(p) = self.popouts.iter_mut().find(|p| p.console.id == id) {
+                    p.gp.visible = v;
+                    p.gp.apply(&p.window, false);
+                    return;
+                }
+                let _ = id;
+                self.gp.visible = v;
                 self.update_cursor();
             }
             other => {
@@ -800,7 +1051,46 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, ev: WindowEvent) {
+    /// Raw mouse motion: the captured console's relative movement (games).
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, ev: winit::event::DeviceEvent) {
+        #[cfg(windows)]
+        if let winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) } = ev {
+            let (dx, dy) = (dx.round() as i32, dy.round() as i32);
+            if dx == 0 && dy == 0 {
+                return;
+            }
+            if self.gp.captured
+                && let Some(c) = &self.console
+            {
+                c.mouse_by(dx, dy);
+            } else if let Some(p) = self.popouts.iter().find(|p| p.gp.captured) {
+                p.console.mouse_by(dx, dy);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = ev;
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        #[cfg(windows)]
+        if !self.popout_requests.is_empty() {
+            self.open_popouts(el);
+        }
+        #[cfg(not(windows))]
+        let _ = el;
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, ev: WindowEvent) {
+        if let WindowEvent::ModifiersChanged(m) = &ev {
+            self.mods = m.state();
+        }
+        #[cfg(windows)]
+        if self.gfx.as_ref().is_some_and(|g| g.window.id() != id) {
+            self.popout_event(id, &ev);
+            return;
+        }
+        #[cfg(not(windows))]
+        let _ = id;
         match ev {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => {
@@ -835,6 +1125,14 @@ impl ApplicationHandler<UserEvent> for App {
                 #[cfg(windows)]
                 if !focused && let Some(c) = &mut self.console {
                     c.release_keys();
+                    if self.gp.captured
+                        && let Some(g) = &self.gfx
+                    {
+                        set_capture(&g.window, c, &mut self.gp, false);
+                        if let Some(ui) = &mut self.ui {
+                            ui.set_mouse_captured(false);
+                        }
+                    }
                 }
                 let remote = platform::is_remote_session();
                 if let Some(ui) = &mut self.ui {
@@ -845,14 +1143,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.after_input();
             }
-            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::ModifiersChanged(_) => {}
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as i32, position.y as i32);
                 #[cfg(windows)]
                 if let Some(c) = &mut self.console {
                     let inside = c.pointer(position.x, position.y);
-                    if inside != self.over_guest {
-                        self.over_guest = inside;
+                    if inside != self.gp.over {
+                        self.gp.over = inside;
                         self.update_cursor();
                     }
                 }
@@ -871,18 +1169,27 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 #[cfg(windows)]
                 if let Some(c) = &self.console {
-                    let up = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
-                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
-                    };
-                    c.wheel(up);
+                    c.wheel(wheel_up(&delta));
                 }
                 #[cfg(not(windows))]
                 let _ = delta;
             }
             WindowEvent::KeyboardInput { event, .. } if self.console_open() => {
                 #[cfg(windows)]
-                if let Some(c) = &mut self.console {
+                if is_capture_key(self.mods, &event) {
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && let (Some(g), Some(c)) = (&self.gfx, &mut self.console)
+                    {
+                        let on = !self.gp.captured;
+                        set_capture(&g.window, c, &mut self.gp, on);
+                        let captured = self.gp.captured;
+                        if let Some(ui) = &mut self.ui {
+                            ui.set_mouse_captured(captured);
+                        }
+                        self.after_input();
+                    }
+                } else if let Some(c) = &mut self.console {
                     use winit::platform::scancode::PhysicalKeyExtScancode;
                     if let Some(sc) = event.physical_key.to_scancode() {
                         c.key(sc, event.state == ElementState::Pressed);

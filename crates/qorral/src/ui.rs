@@ -98,6 +98,10 @@ pub enum Action {
     SendCtrlAltDel {
         id: String,
     },
+    /// Move this machine's console into its own window.
+    PopOutConsole {
+        id: String,
+    },
 }
 
 /// How the window frame looks.
@@ -151,6 +155,7 @@ enum Hit {
     DockNew,
     Suggest(usize),
     ConsoleBack,
+    ConsolePopOut,
     ConsoleCad,
     ConsoleStop,
     Guest,
@@ -253,6 +258,8 @@ pub struct Ui {
     pub console_live: bool,
     /// Open this machine's console as soon as it runs (it was started from here).
     open_when_running: Option<String>,
+    /// The console has the mouse (relative motion for games).
+    pub mouse_captured: bool,
 }
 
 impl Ui {
@@ -291,6 +298,7 @@ impl Ui {
             console: None,
             console_live: false,
             open_when_running: None,
+            mouse_captured: false,
         };
         ui.layout();
         ui.invalidate();
@@ -392,6 +400,14 @@ impl Ui {
             self.console_live = false;
             self.actions.push(Action::CloseConsole);
             self.relayout();
+        }
+    }
+
+    /// The console captured or released the mouse.
+    pub fn set_mouse_captured(&mut self, on: bool) {
+        if self.mouse_captured != on {
+            self.mouse_captured = on;
+            self.damage.push(Rect::new(0, 0, self.w, self.bar_h()));
         }
     }
 
@@ -517,6 +533,11 @@ impl Ui {
         let cad = Rect::new(stop.x - self.p(8.0) - self.p(132.0), y, self.p(132.0), h);
         (back, cad, stop)
     }
+    /// Pop out, left of Ctrl+Alt+Del.
+    fn popout_button(&self) -> Rect {
+        let (_, cad, _) = self.console_buttons();
+        Rect::new(cad.x - self.p(8.0) - self.p(104.0), cad.y, self.p(104.0), cad.h)
+    }
     fn stage_rect(&self) -> Rect {
         let y = self.bar_h();
         Rect::new(0, y, self.w - self.drawer_w(), self.h - y - self.dock_h())
@@ -598,6 +619,7 @@ impl Ui {
         if self.console.is_some() {
             let (back, cad, stop) = self.console_buttons();
             hits.push((back, Hit::ConsoleBack));
+            hits.push((self.popout_button(), Hit::ConsolePopOut));
             hits.push((cad, Hit::ConsoleCad));
             hits.push((stop, Hit::ConsoleStop));
             hits.push((self.console_guest_rect(), Hit::Guest));
@@ -645,8 +667,8 @@ impl Ui {
         let bw = c.w / 3;
         let b = self.bar_rect();
         let controls = if self.console.is_some() {
-            let (back, cad, stop) = self.console_buttons();
-            vec![(back.x, back.right()), (cad.x, stop.right())]
+            let (back, _, stop) = self.console_buttons();
+            vec![(back.x, back.right()), (self.popout_button().x, stop.right())]
         } else if self.vms.is_empty() {
             Vec::new()
         } else {
@@ -731,6 +753,7 @@ impl Ui {
                     | Hit::Suggest(_)
                     | Hit::Screen
                     | Hit::ConsoleBack
+                    | Hit::ConsolePopOut
                     | Hit::ConsoleCad
                     | Hit::ConsoleStop
             )
@@ -788,6 +811,12 @@ impl Ui {
                 self.actions.push(Action::Create(Draft { preset, ..Draft::default() }));
             }
             Some(Hit::ConsoleBack) => self.close_console(),
+            Some(Hit::ConsolePopOut) => {
+                if let Some(id) = self.console.clone() {
+                    self.close_console();
+                    self.actions.push(Action::PopOutConsole { id });
+                }
+            }
             Some(Hit::ConsoleCad) => {
                 if let Some(id) = self.console.clone() {
                     self.actions.push(Action::SendCtrlAltDel { id });
@@ -1029,7 +1058,20 @@ impl Ui {
         x += self.fs(14.0);
         let s12 = self.fs(12.0);
         let lb = self.baseline(bar, reg, s12);
-        self.te.draw(cv, reg, s12, x, lb, &label, th::MUTED, (cad.x as f32 - x - self.fs(16.0)).max(0.0));
+        let pop = self.popout_button();
+        x = self.te.draw(cv, reg, s12, x, lb, &label, th::MUTED, (pop.x as f32 - x - self.fs(16.0)).max(0.0));
+        // How to capture or release the mouse, right-aligned before the buttons when it fits.
+        let (hint, hint_col) = if self.mouse_captured {
+            ("Mouse captured · Ctrl+Alt+G releases it", th::ACCENT)
+        } else {
+            ("Ctrl+Alt+G captures the mouse", th::FAINT)
+        };
+        let hw = self.te.measure(reg, s12, hint);
+        let hx = pop.x as f32 - self.fs(18.0) - hw;
+        if hx > x + self.fs(24.0) {
+            self.te.draw(cv, reg, s12, hx, lb, hint, hint_col, hw + 2.0);
+        }
+        self.button(cv, pop, "Pop out", false, self.hover == Some(Hit::ConsolePopOut), false);
         self.button(cv, cad, "Ctrl+Alt+Del", false, self.hover == Some(Hit::ConsoleCad), false);
         let stopping = v.state == RunState::Stopping;
         self.button(cv, stop, "Shut down", false, self.hover == Some(Hit::ConsoleStop), stopping);
