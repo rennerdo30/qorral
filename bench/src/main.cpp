@@ -331,12 +331,26 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
     std::string latencySource;
 
     auto seconds = [](clock::duration d) { return std::chrono::duration<double>(d).count(); };
+    const bool traceMarks = std::getenv("QORRAL_BENCH_MARK") != nullptr;
+    bool markPending = false;
+    auto markTime = []() -> unsigned long long {
+#ifdef _WIN32
+        FILETIME ft;
+        GetSystemTimePreciseAsFileTime(&ft);
+        return (static_cast<unsigned long long>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+#else
+        return 0;
+#endif
+    };
     auto pumpEvents = [&] {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) aborted = true;
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) aborted = true;
-            else if ((ev.type == SDL_KEYDOWN && !ev.key.repeat) || ev.type == SDL_MOUSEBUTTONDOWN) ++inputs;
+            else if ((ev.type == SDL_KEYDOWN && !ev.key.repeat) || ev.type == SDL_MOUSEBUTTONDOWN) {
+                ++inputs;
+                if (traceMarks) { std::printf("mark key %llu\n", markTime()); markPending = true; }
+            }
             if (ev.type == SDL_WINDOWEVENT && (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                                                ev.window.event == SDL_WINDOWEVENT_RESIZED))
                 needRecreate = !o.offscreen;
@@ -348,7 +362,9 @@ bool runScene(gfx::Device& dev, SDL_Window* window, const Options& o, const std:
         // wait for a whole display cycle, and input from that wait belongs in this frame.
         if (scene->closedLoop()) pumpEvents();
         scene->record(dev, FrameInfo{dev.frameSlot(), t, dt, inputs});
+        if (markPending) std::printf("mark record %llu\n", markTime());
         const bool recreate = dev.endFrame(capture);
+        if (markPending) { std::printf("mark presented %llu\n", markTime()); markPending = false; }
         if (scene->closedLoop()) {
             std::string source;
             const double ms = dev.waitPresented(source);

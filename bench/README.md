@@ -78,6 +78,10 @@ after every key or mouse-button press, and renders one frame at a time.
   a key through QEMU and times until the changed frame reaches QEMU's display (Qorral's QEMU
   `x-qorral-latency-probe`). It reports median, p90, min and max over `--samples` presses. Showing
   the frame in a host window comes on top of that number.
+- **Lining up with a guest trace:** with `QORRAL_BENCH_MARK=1` in its environment, the scene prints
+  `mark key`, `mark record` and `mark presented` lines for each press: the system time (Windows
+  FILETIME, 100 ns) when it saw the input, recorded the changed frame and returned from presenting
+  it, on the same clock as an ETW trace of the guest.
 
 ## Command line
 
