@@ -72,7 +72,7 @@ fn main() {
             }
             if last != 0
                 && c.has(last)
-                && let Err(e) = c.present(last, dst)
+                && let Err(e) = c.present(Some(last), dst)
             {
                 st.errors.push(e.to_string());
             }
@@ -217,7 +217,7 @@ fn main() {
                                 present_last(st);
                                 None
                             } else if let Some(c) = st.comp.as_mut() {
-                                c.present(resource_id, dst).map_err(|e| st.errors.push(e.to_string())).ok()
+                                c.present(Some(resource_id), dst).map_err(|e| st.errors.push(e.to_string())).ok()
                             } else {
                                 None
                             }

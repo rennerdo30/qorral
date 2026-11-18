@@ -2,6 +2,7 @@
 //! crate, and both drive VMs only through `qorral-core`.
 
 pub mod cli;
+pub mod console;
 #[cfg(windows)]
 pub mod frame;
 pub mod intent;
@@ -55,6 +56,10 @@ pub struct GuiArgs {
     pub select: Option<String>,
     /// Snapshot with the details drawer open.
     pub details: bool,
+    /// Snapshot of the selected machine's console (title row and the poster before frames).
+    pub console: bool,
+    /// Open this machine's console (id or name) as soon as it runs.
+    pub open: Option<String>,
 }
 
 pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, String> {
@@ -77,6 +82,8 @@ pub fn parse_gui_args(args: impl Iterator<Item = String>) -> Result<GuiArgs, Str
             "--query" => a.query = Some(val("--query")?),
             "--select" => a.select = Some(val("--select")?),
             "--details" => a.details = true,
+            "--console" => a.console = true,
+            "--open" => a.open = Some(val("--open")?),
             "--hover" => {
                 let v = val("--hover")?;
                 let (x, y) = v.split_once(',').ok_or("--hover is X,Y")?;

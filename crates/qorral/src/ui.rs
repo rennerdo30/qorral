@@ -87,6 +87,16 @@ pub enum Action {
     },
     /// Ask for an install image, then create the machine from the draft.
     Create(Draft),
+    /// Show this running machine's screen in the window (its console).
+    OpenConsole {
+        id: String,
+    },
+    /// Back to the library.
+    CloseConsole,
+    /// Press Ctrl+Alt+Del in the guest.
+    SendCtrlAltDel {
+        id: String,
+    },
 }
 
 /// How the window frame looks.
@@ -139,6 +149,10 @@ enum Hit {
     Dock(usize),
     DockNew,
     Suggest(usize),
+    ConsoleBack,
+    ConsoleCad,
+    ConsoleStop,
+    Guest,
 }
 
 pub struct Fonts {
@@ -232,6 +246,12 @@ pub struct Ui {
     maximized: bool,
     active: bool,
     pub win_action: Option<WinAction>,
+    /// The machine whose console fills the window, if any.
+    pub console: Option<String>,
+    /// The console shows live frames (the GPU path); until then a poster.
+    pub console_live: bool,
+    /// Open this machine's console as soon as it runs (it was started from here).
+    open_when_running: Option<String>,
 }
 
 impl Ui {
@@ -267,6 +287,9 @@ impl Ui {
             maximized: false,
             active: true,
             win_action: None,
+            console: None,
+            console_live: false,
+            open_when_running: None,
         };
         ui.layout();
         ui.invalidate();
@@ -312,9 +335,71 @@ impl Ui {
             vms.iter().find(|v| matches!(v.state, RunState::Running { .. })).or(vms.first()).map(|v| v.id.clone())
         });
         self.vms = vms;
+        let running =
+            |id: &str, vms: &[VmView]| vms.iter().any(|v| v.id == id && matches!(v.state, RunState::Running { .. }));
+        if let Some(key) = self.open_when_running.clone()
+            && let Some(v) = self.vms.iter().find(|v| {
+                (v.id == key || v.name.eq_ignore_ascii_case(&key)) && matches!(v.state, RunState::Running { .. })
+            })
+        {
+            let id = v.id.clone();
+            self.open_when_running = None;
+            self.open_console(&id);
+        }
+        if let Some(id) = self.console.clone()
+            && !running(&id, &self.vms)
+        {
+            self.close_console();
+        }
         self.update_glow();
         self.refresh_results();
         self.relayout();
+    }
+
+    /// Shows a running machine's console in the window.
+    pub fn open_console(&mut self, id: &str) {
+        if self.console.as_deref() == Some(id) {
+            return;
+        }
+        if self.console.is_some() {
+            self.actions.push(Action::CloseConsole);
+        }
+        self.console = Some(id.to_string());
+        self.console_live = false;
+        self.select_id(id);
+        self.actions.push(Action::OpenConsole { id: id.to_string() });
+        self.relayout();
+    }
+
+    /// Opens this machine's console (id or name) now if it runs, else once it does.
+    pub fn open_when_ready(&mut self, key: &str) {
+        let Some(v) = self.vms.iter().find(|v| v.id == key || v.name.eq_ignore_ascii_case(key)) else {
+            self.open_when_running = Some(key.to_string());
+            return;
+        };
+        let id = v.id.clone();
+        if matches!(v.state, RunState::Running { .. }) {
+            self.open_console(&id);
+        } else {
+            self.open_when_running = Some(id);
+        }
+    }
+
+    /// Back to the library.
+    pub fn close_console(&mut self) {
+        if self.console.take().is_some() {
+            self.console_live = false;
+            self.actions.push(Action::CloseConsole);
+            self.relayout();
+        }
+    }
+
+    /// The console now shows live frames (or stopped showing them).
+    pub fn set_console_live(&mut self, live: bool) {
+        if self.console_live != live {
+            self.console_live = live;
+            self.invalidate();
+        }
     }
 
     pub fn select_id(&mut self, id: &str) {
@@ -413,6 +498,24 @@ impl Ui {
             Rect::new((self.w - w) / 2, (self.bar_h() - h) / 2, w, h)
         }
     }
+    /// Where the guest's screen goes while a console is open: everything under the title row.
+    pub fn console_guest_rect(&self) -> Rect {
+        Rect::new(0, self.bar_h(), self.w, (self.h - self.bar_h()).max(0))
+    }
+    /// The console's title row height (the part drawn over the guest).
+    pub fn console_bar_height(&self) -> i32 {
+        self.bar_h()
+    }
+    /// Back, Ctrl+Alt+Del and Shut down in the console's title row.
+    fn console_buttons(&self) -> (Rect, Rect, Rect) {
+        let h = self.p(32.0);
+        let y = (self.bar_h() - h) / 2;
+        let back = Rect::new(self.mac_inset() + self.p(12.0), y, self.p(104.0), h);
+        let right = if self.caption_rect().is_empty() { self.w } else { self.caption_rect().x } - self.p(14.0);
+        let stop = Rect::new(right - self.p(108.0), y, self.p(108.0), h);
+        let cad = Rect::new(stop.x - self.p(8.0) - self.p(132.0), y, self.p(132.0), h);
+        (back, cad, stop)
+    }
     fn stage_rect(&self) -> Rect {
         let y = self.bar_h();
         Rect::new(0, y, self.w - self.drawer_w(), self.h - y - self.dock_h())
@@ -491,6 +594,15 @@ impl Ui {
 
     fn layout(&mut self) {
         let mut hits = Vec::new();
+        if self.console.is_some() {
+            let (back, cad, stop) = self.console_buttons();
+            hits.push((back, Hit::ConsoleBack));
+            hits.push((cad, Hit::ConsoleCad));
+            hits.push((stop, Hit::ConsoleStop));
+            hits.push((self.console_guest_rect(), Hit::Guest));
+            self.hits = hits;
+            return;
+        }
         if self.results_open() {
             for i in 0..self.results.len() {
                 hits.push((self.result_rect(i), Hit::Result(i)));
@@ -531,7 +643,14 @@ impl Ui {
         let c = self.caption_rect();
         let bw = c.w / 3;
         let b = self.bar_rect();
-        let controls = if self.vms.is_empty() { Vec::new() } else { vec![(b.x, b.right())] };
+        let controls = if self.console.is_some() {
+            let (back, cad, stop) = self.console_buttons();
+            vec![(back.x, back.right()), (cad.x, stop.right())]
+        } else if self.vms.is_empty() {
+            Vec::new()
+        } else {
+            vec![(b.x, b.right())]
+        };
         TitleGeometry {
             height: self.bar_h(),
             controls,
@@ -610,6 +729,9 @@ impl Ui {
                     | Hit::DockNew
                     | Hit::Suggest(_)
                     | Hit::Screen
+                    | Hit::ConsoleBack
+                    | Hit::ConsoleCad
+                    | Hit::ConsoleStop
             )
         )
     }
@@ -664,7 +786,18 @@ impl Ui {
                 let preset = TILES.get(i).map(|t| t.0);
                 self.actions.push(Action::Create(Draft { preset, ..Draft::default() }));
             }
-            None => {}
+            Some(Hit::ConsoleBack) => self.close_console(),
+            Some(Hit::ConsoleCad) => {
+                if let Some(id) = self.console.clone() {
+                    self.actions.push(Action::SendCtrlAltDel { id });
+                }
+            }
+            Some(Hit::ConsoleStop) => {
+                if let Some(id) = self.console.clone() {
+                    self.actions.push(Action::Stop { id, force: false });
+                }
+            }
+            Some(Hit::Guest) | None => {}
         }
     }
 
@@ -679,8 +812,11 @@ impl Ui {
         let Some(v) = self.selected_vm() else { return };
         let id = v.id.clone();
         match v.state {
-            RunState::Off | RunState::Failed(_) => self.actions.push(Action::Start { id, window: true }),
-            RunState::Running { .. } => self.actions.push(Action::Stop { id, force: false }),
+            RunState::Off | RunState::Failed(_) => {
+                self.open_when_running = Some(id.clone());
+                self.actions.push(Action::Start { id, window: false });
+            }
+            RunState::Running { .. } => self.open_console(&id),
             RunState::Starting | RunState::Stopping => {}
         }
     }
@@ -690,7 +826,8 @@ impl Ui {
         let id = v.id.clone();
         match v.state {
             RunState::Off | RunState::Failed(_) => self.actions.push(Action::Start { id, window: false }),
-            RunState::Running { .. } | RunState::Stopping => self.actions.push(Action::Stop { id, force: true }),
+            RunState::Running { .. } => self.actions.push(Action::Stop { id, force: false }),
+            RunState::Stopping => self.actions.push(Action::Stop { id, force: true }),
             RunState::Starting => {}
         }
     }
@@ -708,11 +845,18 @@ impl Ui {
             Intent::Create(d) => self.actions.push(Action::Create(d)),
             Intent::Machine(verb, m) => {
                 let Some(v) = self.vms.get(m) else { return };
-                let id = v.id.clone();
+                let (id, running) = (v.id.clone(), matches!(v.state, RunState::Running { .. }));
                 self.select_id(&id);
                 match verb {
-                    Verb::Open => {}
-                    Verb::Start => self.actions.push(Action::Start { id, window: true }),
+                    Verb::Open => {
+                        if running {
+                            self.open_console(&id);
+                        }
+                    }
+                    Verb::Start => {
+                        self.open_when_running = Some(id.clone());
+                        self.actions.push(Action::Start { id, window: false });
+                    }
                     Verb::Stop => self.actions.push(Action::Stop { id, force: false }),
                     Verb::ForceOff => self.actions.push(Action::Stop { id, force: true }),
                 }
@@ -808,6 +952,11 @@ impl Ui {
 
     fn paint_all(&mut self, cv: &mut Canvas) {
         cv.fill(Rect::new(0, 0, self.w, self.h), th::BG);
+        if self.console.is_some() {
+            self.paint_console(cv);
+            self.paint_toast(cv);
+            return;
+        }
         if self.vms.is_empty() {
             self.paint_welcome(cv);
         } else {
@@ -821,6 +970,10 @@ impl Ui {
         if self.results_open() {
             self.paint_results(cv);
         }
+        self.paint_toast(cv);
+    }
+
+    fn paint_toast(&mut self, cv: &mut Canvas) {
         if let Some(t) = self.toast.clone() {
             let r = self.toast_rect();
             cv.fill_round(r, self.fs(12.0), 0x2A1B20);
@@ -836,6 +989,66 @@ impl Ui {
                 th::TEXT,
             );
         }
+    }
+
+    /// The console: a slim title row (back, machine, Ctrl+Alt+Del, shut down) over the guest.
+    /// The guest area is painted only until live frames arrive (the GPU path draws it).
+    fn paint_console(&mut self, cv: &mut Canvas) {
+        let Some(v) = self.console.clone().and_then(|id| self.vms.iter().find(|v| v.id == id).cloned()) else {
+            return;
+        };
+        let (reg, semi) = (self.f.regular, self.f.semi);
+        let bar = Rect::new(0, 0, self.w, self.bar_h());
+        cv.fill(bar, th::BG);
+        cv.fill(Rect::new(0, bar.bottom() - 1, self.w, 1), th::BORDER);
+        let (back, cad, stop) = self.console_buttons();
+        // Back to the library: a chevron and the word.
+        let bh = self.hover == Some(Hit::ConsoleBack);
+        cv.round_border(
+            back,
+            self.fs(9.0),
+            if bh { th::BORDER_STRONG } else { th::BG },
+            if bh { th::CARD } else { th::BG },
+        );
+        let (cx, cy) = (back.x as f32 + self.fs(18.0), back.y as f32 + back.h as f32 / 2.0);
+        let k = self.fs(4.5);
+        cv.stroke(&[(cx + k * 0.5, cy - k), (cx - k * 0.6, cy), (cx + k * 0.5, cy + k)], self.fs(1.8), th::TEXT);
+        let s13 = self.fs(13.0);
+        let b = self.baseline(back, semi, s13);
+        self.te.draw(cv, semi, s13, cx + self.fs(14.0), b, "Library", th::TEXT, back.w as f32);
+        // The machine and its state.
+        let (label, color) = self.state_style(&v.state);
+        let mut x = back.right() as f32 + self.fs(20.0);
+        let s14 = self.fs(14.0);
+        let nb = self.baseline(bar, semi, s14);
+        let room = (cad.x as f32 - x - self.fs(24.0)).max(0.0);
+        x = self.te.draw(cv, semi, s14, x, nb, &v.name, th::TEXT, room * 0.6);
+        x += self.fs(14.0);
+        cv.fill_circle(x + self.fs(4.0), bar.h as f32 / 2.0, self.fs(4.0), color);
+        x += self.fs(14.0);
+        let s12 = self.fs(12.0);
+        let lb = self.baseline(bar, reg, s12);
+        self.te.draw(cv, reg, s12, x, lb, &label, th::MUTED, (cad.x as f32 - x - self.fs(16.0)).max(0.0));
+        self.button(cv, cad, "Ctrl+Alt+Del", false, self.hover == Some(Hit::ConsoleCad), false);
+        let stopping = v.state == RunState::Stopping;
+        self.button(cv, stop, "Shut down", false, self.hover == Some(Hit::ConsoleStop), stopping);
+        self.paint_caption(cv);
+
+        // The guest area until live frames arrive: the last screen, dimmed, and a word.
+        let g = self.console_guest_rect();
+        if self.console_live || cv.clip().intersect(g).is_empty() {
+            return;
+        }
+        cv.fill(g, 0x07080B);
+        if let Some(t) = v.thumb.as_ref().filter(|t| t.w > 0 && t.h > 0) {
+            let k = (g.w as f32 / t.w as f32).min(g.h as f32 / t.h as f32);
+            let (w, h) = ((t.w as f32 * k) as i32, (t.h as f32 * k) as i32);
+            let r = Rect::new(g.x + (g.w - w) / 2, g.y + (g.h - h) / 2, w, h);
+            cv.draw_rgba_scaled(r, t.w, t.h, &t.rgba);
+            cv.fill_alpha(r, th::BG, 150);
+        }
+        let (cx, cy) = (g.x as f32 + g.w as f32 / 2.0, g.y as f32 + g.h as f32 / 2.0);
+        self.centered(cv, semi, self.fs(16.0), cx, cy, "Connecting to the display…", th::TEXT);
     }
 
     fn baseline(&self, r: Rect, f: FontId, size: f32) -> f32 {
@@ -1058,8 +1271,10 @@ impl Ui {
         self.te.draw(cv, reg, self.fs(13.0), x, ly, &specs, th::MUTED, (pr.x as f32 - x - self.fs(16.0)).max(0.0));
 
         let busy = matches!(v.state, RunState::Starting | RunState::Stopping);
-        let (pl, sl) = if running || v.state == RunState::Stopping {
-            ("Shut down", "Force off")
+        let (pl, sl) = if running {
+            ("Open", "Shut down")
+        } else if v.state == RunState::Stopping {
+            ("Open", "Force off")
         } else {
             ("Start", "Start in background")
         };
@@ -1124,7 +1339,7 @@ impl Ui {
                 let b = self.baseline(tag, semi, s);
                 self.te.draw(cv, semi, s, tag.x as f32 + self.fs(18.0), b, "LIVE", th::TEXT, w + 2.0);
                 if hover {
-                    self.big_action(cv, cx, cy, false, "Shut down");
+                    self.big_action(cv, cx, cy, false, "Open");
                 }
             }
             RunState::Starting => {

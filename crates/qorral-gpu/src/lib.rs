@@ -168,7 +168,27 @@ pub struct Compositor {
 
     target: Target,
     window: Option<Window>,
+    overlay: Option<Overlay>,
     guests: HashMap<u32, Guest>,
+}
+
+/// UI pixels drawn over the guest (the app's top bar): a sampled image filled from a
+/// persistently mapped staging buffer, uploaded only when it changed.
+struct Overlay {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    set: vk::DescriptorSet,
+    staging: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    /// The staging buffer's mapping (an address; kept as an integer so the compositor stays Send).
+    map: usize,
+    width: u32,
+    height: u32,
+    rect: [f32; 4],
+    dirty: std::cell::Cell<bool>,
+    /// Pixels were set at least once.
+    ready: bool,
 }
 
 /// A window target: surface, swapchain and its framebuffers.
@@ -330,6 +350,7 @@ impl Compositor {
                 readback_memory: vk::DeviceMemory::null(),
             },
             window: None,
+            overlay: None,
             guests: HashMap::new(),
         };
         // From here Drop cleans up whatever was created.
@@ -847,112 +868,156 @@ impl Compositor {
         self.guests.contains_key(&resource_id)
     }
 
-    /// Records drawing guest buffer `resource_id` into `dst` of a render pass instance (into
-    /// the begun command buffer).
+    /// Records one frame into the begun command buffer: the guest buffer (if any) into its
+    /// destination rectangle, then the overlay (if any) on top.
     fn record(
         &self,
-        resource_id: u32,
-        dst: [f32; 4],
+        guest: Option<(u32, [f32; 4])>,
         pass: vk::RenderPass,
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
     ) -> Result<(), Error> {
-        let g = self
-            .guests
-            .get(&resource_id)
-            .ok_or_else(|| Error::Unsupported(format!("guest buffer {resource_id} not imported")))?;
-        let d = &self.device;
-        let mut push = [0u8; PUSH_SIZE as usize];
-        let put = |push: &mut [u8], at: usize, bytes: [u8; 4]| push[at..at + 4].copy_from_slice(&bytes);
-        for (i, v) in dst.iter().enumerate() {
-            put(&mut push, i * 4, v.to_le_bytes());
-        }
-        let (pipe, set) = match g {
-            Guest::Image { set, src, .. } => {
-                for (i, v) in src.iter().enumerate() {
-                    put(&mut push, 16 + i * 4, v.to_le_bytes());
-                }
-                (&self.image_pipe, *set)
-            }
-            Guest::Buffer { set, layout: l, .. } => {
-                let words = [(l.offset / 4) as u32, l.stride / 4, l.width, l.height];
-                for (i, v) in words.iter().enumerate() {
-                    put(&mut push, 16 + i * 4, v.to_le_bytes());
-                }
-                (&self.buffer_pipe, *set)
-            }
+        let guest = match guest {
+            Some((id, dst)) => Some((
+                self.guests.get(&id).ok_or_else(|| Error::Unsupported(format!("guest buffer {id} not imported")))?,
+                dst,
+            )),
+            None => None,
         };
-        // SAFETY: one command buffer, recorded and waited for here; handles are live.
+        let d = &self.device;
+        // SAFETY: the command buffer is begun; handles are live; every frame is waited for.
         unsafe {
-            match g {
-                Guest::Image { image, .. } => {
-                    // Take the guest's image from the external queue (QEMU's renderer), keeping
-                    // its contents (GENERAL to GENERAL: no layout change that could discard them).
-                    let acquire = [vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .old_layout(vk::ImageLayout::GENERAL)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                        .dst_queue_family_index(self.queue_family)
-                        .image(*image)
-                        .subresource_range(color_range())];
-                    d.cmd_pipeline_barrier(
-                        self.cmd,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &[],
-                        &acquire,
-                    );
+            if let Some(g) = guest {
+                match g.0 {
+                    Guest::Image { image, .. } => {
+                        // Take the guest's image from the external queue (QEMU's renderer), keeping
+                        // its contents (GENERAL to GENERAL: no layout change that could discard them).
+                        let acquire = [vk::ImageMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::empty())
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                            .old_layout(vk::ImageLayout::GENERAL)
+                            .new_layout(vk::ImageLayout::GENERAL)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                            .dst_queue_family_index(self.queue_family)
+                            .image(*image)
+                            .subresource_range(color_range())];
+                        d.cmd_pipeline_barrier(
+                            self.cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &[],
+                            &acquire,
+                        );
+                    }
+                    Guest::Buffer { buffer, copy, layout: l, .. } => {
+                        let acquire = [vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::empty())
+                            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                            .dst_queue_family_index(self.queue_family)
+                            .buffer(*buffer)
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)];
+                        d.cmd_pipeline_barrier(
+                            self.cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &acquire,
+                            &[],
+                        );
+                        d.cmd_copy_buffer(
+                            self.cmd,
+                            *buffer,
+                            *copy,
+                            &[vk::BufferCopy {
+                                src_offset: l.offset,
+                                dst_offset: l.offset,
+                                size: u64::from(l.stride) * u64::from(l.height),
+                            }],
+                        );
+                        let ready = [vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .buffer(*copy)
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)];
+                        d.cmd_pipeline_barrier(
+                            self.cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::FRAGMENT_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[],
+                            &ready,
+                            &[],
+                        );
+                    }
                 }
-                Guest::Buffer { buffer, copy, layout: l, .. } => {
-                    let acquire = [vk::BufferMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                        .dst_queue_family_index(self.queue_family)
-                        .buffer(*buffer)
-                        .offset(0)
-                        .size(vk::WHOLE_SIZE)];
-                    d.cmd_pipeline_barrier(
-                        self.cmd,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &acquire,
-                        &[],
-                    );
-                    d.cmd_copy_buffer(
-                        self.cmd,
-                        *buffer,
-                        *copy,
-                        &[vk::BufferCopy {
-                            src_offset: l.offset,
-                            dst_offset: l.offset,
-                            size: u64::from(l.stride) * u64::from(l.height),
-                        }],
-                    );
-                    let ready = [vk::BufferMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .buffer(*copy)
-                        .offset(0)
-                        .size(vk::WHOLE_SIZE)];
-                    d.cmd_pipeline_barrier(
-                        self.cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
-                        vk::DependencyFlags::empty(),
-                        &[],
-                        &ready,
-                        &[],
-                    );
-                }
+            }
+            if let Some(o) = &self.overlay
+                && o.dirty.get()
+            {
+                let to_dst = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(o.image)
+                    .subresource_range(color_range())];
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_dst,
+                );
+                d.cmd_copy_buffer_to_image(
+                    self.cmd,
+                    o.staging,
+                    o.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D { width: o.width, height: o.height, depth: 1 },
+                    }],
+                );
+                let to_read = [vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(o.image)
+                    .subresource_range(color_range())];
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &to_read,
+                );
+                o.dirty.set(false);
             }
             let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.06, 0.06, 0.07, 1.0] } }];
             d.cmd_begin_render_pass(
@@ -960,23 +1025,63 @@ impl Compositor {
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(pass)
                     .framebuffer(framebuffer)
-                    .render_area(vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D { width: extent.width, height: extent.height },
-                    })
+                    .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
                     .clear_values(&clear),
                 vk::SubpassContents::INLINE,
             );
+            if let Some((g, dst)) = guest {
+                let mut push = [0u8; PUSH_SIZE as usize];
+                let put = |push: &mut [u8], at: usize, bytes: [u8; 4]| push[at..at + 4].copy_from_slice(&bytes);
+                for (i, v) in dst.iter().enumerate() {
+                    put(&mut push, i * 4, v.to_le_bytes());
+                }
+                let (pipe, set) = match g {
+                    Guest::Image { set, src, .. } => {
+                        for (i, v) in src.iter().enumerate() {
+                            put(&mut push, 16 + i * 4, v.to_le_bytes());
+                        }
+                        (&self.image_pipe, *set)
+                    }
+                    Guest::Buffer { set, layout: l, .. } => {
+                        let words = [(l.offset / 4) as u32, l.stride / 4, l.width, l.height];
+                        for (i, v) in words.iter().enumerate() {
+                            put(&mut push, 16 + i * 4, v.to_le_bytes());
+                        }
+                        (&self.buffer_pipe, *set)
+                    }
+                };
+                self.draw_quad(pipe, set, &push, dst, extent);
+            }
+            if let Some(o) = &self.overlay
+                && o.ready
+            {
+                let mut push = [0u8; PUSH_SIZE as usize];
+                let src = [0.0, 0.0, o.width as f32, o.height as f32];
+                for (i, v) in o.rect.iter().chain(src.iter()).enumerate() {
+                    push[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                self.draw_quad(&self.image_pipe, o.set, &push, o.rect, extent);
+            }
+            d.cmd_end_render_pass(self.cmd);
+        }
+        Ok(())
+    }
+
+    /// One full-viewport triangle clipped to `dst` (inside a render pass).
+    fn draw_quad(&self, pipe: &Pipeline, set: vk::DescriptorSet, push: &[u8], dst: [f32; 4], extent: vk::Extent2D) {
+        let d = &self.device;
+        let x0 = (dst[0].max(0.0) as u32).min(extent.width);
+        let y0 = (dst[1].max(0.0) as u32).min(extent.height);
+        let x1 = ((dst[0] + dst[2]).max(0.0) as u32).min(extent.width);
+        let y1 = ((dst[1] + dst[3]).max(0.0) as u32).min(extent.height);
+        // SAFETY: called while recording a render pass with live handles.
+        unsafe {
             d.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipe.pipeline);
             d.cmd_set_viewport(
                 self.cmd,
                 0,
                 &[vk::Viewport { x: dst[0], y: dst[1], width: dst[2], height: dst[3], min_depth: 0.0, max_depth: 1.0 }],
             );
-            let x0 = (dst[0].max(0.0) as u32).min(extent.width);
-            let y0 = (dst[1].max(0.0) as u32).min(extent.height);
-            let x1 = ((dst[0] + dst[2]).max(0.0) as u32).min(extent.width);
-            let y1 = ((dst[1] + dst[3]).max(0.0) as u32).min(extent.height);
             d.cmd_set_scissor(
                 self.cmd,
                 0,
@@ -986,11 +1091,9 @@ impl Compositor {
                 }],
             );
             d.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::GRAPHICS, pipe.layout, 0, &[set], &[]);
-            d.cmd_push_constants(self.cmd, pipe.layout, vk::ShaderStageFlags::FRAGMENT, 0, &push);
+            d.cmd_push_constants(self.cmd, pipe.layout, vk::ShaderStageFlags::FRAGMENT, 0, push);
             d.cmd_draw(self.cmd, 3, 1, 0, 0);
-            d.cmd_end_render_pass(self.cmd);
         }
-        Ok(())
     }
 
     fn begin(&self) -> Result<(), Error> {
@@ -1014,7 +1117,7 @@ impl Compositor {
         let t = &self.target;
         let extent = vk::Extent2D { width: t.width, height: t.height };
         self.begin()?;
-        self.record(resource_id, dst, self.render_pass, t.framebuffer, extent)?;
+        self.record(Some((resource_id, dst)), self.render_pass, t.framebuffer, extent)?;
         let d = &self.device;
         // SAFETY: the command buffer was begun above; handles are live.
         unsafe {
@@ -1191,15 +1294,158 @@ impl Compositor {
         Ok(())
     }
 
+    /// Sets the overlay drawn over the guest: `pixels` (`0x00RRGGBB`, rows of `width`) placed at
+    /// `at` in window pixels. Uploaded with the next frame; recreated when the size changes.
+    pub fn set_overlay(&mut self, pixels: &[u32], width: u32, height: u32, at: (i32, i32)) -> Result<(), Error> {
+        if width == 0 || height == 0 || pixels.len() < (width * height) as usize {
+            self.clear_overlay();
+            return Ok(());
+        }
+        if self.overlay.as_ref().is_none_or(|o| o.width != width || o.height != height) {
+            self.clear_overlay();
+            self.overlay = Some(self.create_overlay(width, height)?);
+        }
+        let Some(o) = self.overlay.as_mut() else { return Ok(()) };
+        // SAFETY: the mapping holds width * height pixels and the GPU is not reading it (every
+        // frame is waited for).
+        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), o.map as *mut u32, (width * height) as usize) };
+        o.rect = [at.0 as f32, at.1 as f32, width as f32, height as f32];
+        o.dirty.set(true);
+        o.ready = true;
+        Ok(())
+    }
+
+    /// Removes the overlay.
+    pub fn clear_overlay(&mut self) {
+        let Some(o) = self.overlay.take() else { return };
+        let d = &self.device;
+        // SAFETY: the GPU is idle between frames; these are ours.
+        unsafe {
+            let _ = d.free_descriptor_sets(self.pool, &[o.set]);
+            d.destroy_image_view(o.view, None);
+            d.destroy_image(o.image, None);
+            d.free_memory(o.memory, None);
+            d.unmap_memory(o.staging_memory);
+            d.destroy_buffer(o.staging, None);
+            d.free_memory(o.staging_memory, None);
+        }
+    }
+
+    fn create_overlay(&self, width: u32, height: u32) -> Result<Overlay, Error> {
+        let d = &self.device;
+        let (staging, staging_memory) = self.create_buffer(
+            u64::from(width) * u64::from(height) * 4,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        // SAFETY: valid create infos; everything is destroyed on failure.
+        unsafe {
+            let drop_staging = || {
+                d.destroy_buffer(staging, None);
+                d.free_memory(staging_memory, None);
+            };
+            let map = match d.map_memory(staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) {
+                Ok(p) => p as usize,
+                Err(r) => {
+                    drop_staging();
+                    return Err(Error::Vk("map overlay", r));
+                }
+            };
+            let image = match d.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(FORMAT)
+                    .extent(vk::Extent3D { width, height, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+                None,
+            ) {
+                Ok(i) => i,
+                Err(r) => {
+                    drop_staging();
+                    return Err(Error::Vk("overlay image", r));
+                }
+            };
+            let req = d.get_image_memory_requirements(image);
+            let fail = |e: Error| {
+                d.destroy_image(image, None);
+                drop_staging();
+                e
+            };
+            let ty = self
+                .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .ok_or_else(|| fail(Error::Unsupported("no device-local memory for the overlay".into())))?;
+            let memory = d
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty),
+                    None,
+                )
+                .map_err(|r| fail(Error::Vk("overlay memory", r)))?;
+            let fail = |e: Error| {
+                d.free_memory(memory, None);
+                fail(e)
+            };
+            d.bind_image_memory(image, memory, 0).map_err(|r| fail(Error::Vk("bind overlay", r)))?;
+            let view = d
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(FORMAT)
+                        .subresource_range(color_range()),
+                    None,
+                )
+                .map_err(|r| fail(Error::Vk("overlay view", r)))?;
+            let set = match self.alloc_set(self.image_pipe.set_layout) {
+                Ok(s) => s,
+                Err(e) => {
+                    d.destroy_image_view(view, None);
+                    return Err(fail(e));
+                }
+            };
+            let info = [vk::DescriptorImageInfo {
+                sampler: self.sampler,
+                image_view: view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            d.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(&info)],
+                &[],
+            );
+            Ok(Overlay {
+                image,
+                memory,
+                view,
+                set,
+                staging,
+                staging_memory,
+                map,
+                width,
+                height,
+                rect: [0.0, 0.0, width as f32, height as f32],
+                dirty: std::cell::Cell::new(false),
+                ready: false,
+            })
+        }
+    }
+
     /// The window's size in pixels as the swapchain sees it.
     pub fn window_size(&self) -> (u32, u32) {
         self.window.as_ref().map(|w| (w.extent.width, w.extent.height)).unwrap_or((0, 0))
     }
 
-    /// Presents guest buffer `resource_id` into the window right away, fitted into `dst` (x, y,
-    /// w, h in window pixels), and waits until the GPU finished it (one frame in flight, none
-    /// queued). An out-of-date swapchain is recreated and the frame presented again.
-    pub fn present(&mut self, resource_id: u32, dst: [f32; 4]) -> Result<PresentTiming, Error> {
+    /// Presents a frame into the window right away: guest buffer `guest` (if any) fitted into
+    /// `dst` (x, y, w, h in window pixels) and the overlay on top; waits until the GPU finished
+    /// it (one frame in flight, none queued). An out-of-date swapchain is recreated and the frame
+    /// presented again.
+    pub fn present(&mut self, guest: Option<u32>, dst: [f32; 4]) -> Result<PresentTiming, Error> {
         let mut timing = PresentTiming::default();
         for attempt in 0..2 {
             let Some(w) = self.window.as_ref() else {
@@ -1226,7 +1472,7 @@ impl Compositor {
             let (framebuffer, extent, acquired_sem, rendered_sem, swapchain) =
                 (w.framebuffers[index as usize], w.extent, w.acquired, w.rendered, w.swapchain);
             self.begin()?;
-            self.record(resource_id, dst, self.present_pass, framebuffer, extent)?;
+            self.record(guest.map(|id| (id, dst)), self.present_pass, framebuffer, extent)?;
             let d = &self.device;
             let presented;
             // SAFETY: the command buffer was begun above; handles are live.
@@ -1313,6 +1559,7 @@ impl Drop for Compositor {
             for id in ids {
                 self.forget(id);
             }
+            self.clear_overlay();
             if let Some(mut w) = self.window.take() {
                 for f in w.framebuffers.drain(..) {
                     self.device.destroy_framebuffer(f, None);

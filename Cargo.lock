@@ -1186,6 +1186,8 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "png",
  "qorral-core",
+ "qorral-display",
+ "qorral-gpu",
  "qorral-render",
  "raw-window-handle",
  "serde_json",

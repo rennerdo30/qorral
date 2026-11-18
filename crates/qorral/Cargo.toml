@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 qorral-core = { path = "../qorral-core" }
 qorral-render = { path = "../qorral-render" }
+qorral-display = { path = "../qorral-display" }
+qorral-gpu = { path = "../qorral-gpu" }
 serde_json = "1.0.154"
 winit = "0.30.13"
 softbuffer = "0.4.8"

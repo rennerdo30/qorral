@@ -42,6 +42,11 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         ui.details_open = true;
         ui.resize(w, h, scale);
     }
+    if args.console
+        && let Some(id) = ui.selected.clone()
+    {
+        ui.open_console(&id);
+    }
     if let Some(q) = &args.query {
         ui.text(q);
     }

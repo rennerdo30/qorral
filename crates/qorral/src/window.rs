@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
@@ -37,6 +37,8 @@ pub enum UserEvent {
     Frame,
     /// Another launch asked this window to come to the front.
     Activate,
+    /// News from the open console.
+    Console(crate::console::ConsoleEvent),
 }
 
 type Proxy = Arc<Mutex<EventLoopProxy<UserEvent>>>;
@@ -55,6 +57,8 @@ struct Gfx {
 
 struct App {
     t0: Instant,
+    /// `--open`: the machine whose console to show once it runs.
+    open: Option<String>,
     smoke: bool,
     smoke_reported: bool,
     ui: Option<Ui>,
@@ -72,6 +76,11 @@ struct App {
     /// Title row last sent to the frame's hit test.
     title_sent: Option<crate::ui::TitleGeometry>,
     closing: bool,
+    /// The open console (its machine's screen fills the window under the title row).
+    #[cfg(windows)]
+    console: Option<crate::console::Console>,
+    /// The UI's pixels while a console is open (the compositor shows the title row from it).
+    backing: Vec<u32>,
 }
 
 pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
@@ -122,6 +131,7 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
     }
     let mut app = App {
         t0,
+        open: args.open.clone(),
         smoke: args.smoke,
         smoke_reported: false,
         ui: None,
@@ -138,6 +148,9 @@ pub fn run(args: &GuiArgs, t0: Instant) -> i32 {
         exit_code: 0,
         title_sent: None,
         closing: false,
+        #[cfg(windows)]
+        console: None,
+        backing: Vec::new(),
     };
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("qorral: event loop failed: {e}");
@@ -274,6 +287,16 @@ impl App {
                     send(&p, UserEvent::Views(model::views(&lib, qemu.lock().ok().and_then(|g| g.clone()).as_ref())));
                 });
             }
+            Action::OpenConsole { id } => self.open_console(&id),
+            Action::CloseConsole => self.close_console(),
+            Action::SendCtrlAltDel { id } => {
+                #[cfg(windows)]
+                if let Some(c) = self.console.as_ref().filter(|c| c.id == id) {
+                    c.ctrl_alt_del();
+                }
+                #[cfg(not(windows))]
+                let _ = id;
+            }
             Action::Create(draft) => {
                 let preset = draft.preset;
                 std::thread::spawn(move || {
@@ -344,8 +367,134 @@ impl App {
                 #[cfg(windows)]
                 ui.set_frame_state(crate::frame::max_button_state(), crate::frame::is_zoomed());
             }
+            UserEvent::Console(ev) => self.console_event(ev),
             UserEvent::FontsReady | UserEvent::SmokeTimeout => {}
         }
+    }
+
+    fn open_console(&mut self, id: &str) {
+        #[cfg(windows)]
+        {
+            let (Some(gfx), Some(ui)) = (&self.gfx, &self.ui) else { return };
+            let hinstance = match raw_window_handle::HasWindowHandle::window_handle(&*gfx.window).map(|h| h.as_raw()) {
+                Ok(raw_window_handle::RawWindowHandle::Win32(h)) => h.hinstance.map_or(0, |i| i.get()),
+                _ => 0,
+            };
+            let g = ui.console_guest_rect();
+            let p = self.proxy.clone();
+            let notify: crate::console::Notify = Arc::new(move |ev| send(&p, UserEvent::Console(ev)));
+            self.console = Some(crate::console::Console::open(
+                id,
+                self.lib_root.clone(),
+                (gfx.hwnd, hinstance),
+                (self.size.0 as u32, self.size.1 as u32),
+                [g.x as f32, g.y as f32, g.w as f32, g.h as f32],
+                notify,
+            ));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = id;
+            if let Some(ui) = &mut self.ui {
+                ui.close_console();
+                ui.set_toast(Some("The console is not available on this system yet.".into()));
+            }
+        }
+    }
+
+    fn close_console(&mut self) {
+        #[cfg(windows)]
+        drop(self.console.take());
+        // The compositor drew the window: the CPU path repaints all of it.
+        if let Some(ui) = &mut self.ui {
+            ui.invalidate();
+        }
+    }
+
+    fn console_event(&mut self, ev: crate::console::ConsoleEvent) {
+        use crate::console::ConsoleEvent as E;
+        let Some(ui) = &mut self.ui else { return };
+        match ev {
+            #[cfg(windows)]
+            E::Attached(id, r) => match (r, self.console.as_mut().filter(|c| c.id == id)) {
+                (Ok(d), Some(c)) => c.set_display(d),
+                (Ok(_), None) => {}
+                (Err(e), _) => {
+                    ui.set_toast(Some(format!("The console could not attach: {e}")));
+                    ui.close_console();
+                }
+            },
+            E::Live(id) => {
+                if ui.console.as_deref() == Some(id.as_str()) {
+                    ui.set_console_live(true);
+                }
+            }
+            E::Failed(id, e) => {
+                if ui.console.as_deref() == Some(id.as_str()) {
+                    ui.set_toast(Some(format!("No GPU display for this machine: {e}")));
+                    ui.close_console();
+                }
+            }
+            E::Disconnected(id) => {
+                if ui.console.as_deref() == Some(id.as_str()) {
+                    ui.close_console();
+                }
+            }
+        }
+    }
+
+    /// Console mode: the UI paints into the backing store; the title row goes to the
+    /// compositor, which owns the window once the first guest frame is in. Until then the
+    /// CPU path shows the backing store. Returns false outside console mode.
+    #[cfg(windows)]
+    fn render_console(&mut self) -> bool {
+        let (Some(gfx), Some(ui), Some(c)) = (&mut self.gfx, &mut self.ui, &self.console) else { return false };
+        let (w, h) = self.size;
+        if w == 0 || h == 0 || !ui.has_damage() {
+            return true;
+        }
+        if self.backing.len() != w * h {
+            self.backing = vec![0; w * h];
+            ui.invalidate();
+        }
+        let painted = ui.paint(&mut Canvas::new(&mut self.backing[..], w, h), false);
+        let bar_h = (ui.console_bar_height().max(0) as usize).min(h);
+        c.set_bar(&self.backing[..w * bar_h], w as u32, bar_h as u32);
+        if c.is_presenting() {
+            return true;
+        }
+        let Ok(mut buf) = gfx.surface.buffer_mut() else { return true };
+        if buf.len() < w * h {
+            return true;
+        }
+        buf[..w * h].copy_from_slice(&self.backing);
+        let full = buf.age() == 0;
+        let rects: Vec<softbuffer::Rect> = if full {
+            vec![softbuffer::Rect {
+                x: 0,
+                y: 0,
+                width: NonZeroU32::new(w as u32).unwrap_or(NonZeroU32::MIN),
+                height: NonZeroU32::new(h as u32).unwrap_or(NonZeroU32::MIN),
+            }]
+        } else {
+            painted
+                .iter()
+                .filter_map(|r| {
+                    Some(softbuffer::Rect {
+                        x: r.x.max(0) as u32,
+                        y: r.y.max(0) as u32,
+                        width: NonZeroU32::new(r.w.max(0) as u32)?,
+                        height: NonZeroU32::new(r.h.max(0) as u32)?,
+                    })
+                })
+                .collect()
+        };
+        if !rects.is_empty()
+            && let Err(e) = buf.present_with_damage(&rects)
+        {
+            eprintln!("qorral: present failed: {e}");
+        }
+        true
     }
 
     fn after_input(&mut self) {
@@ -372,6 +521,10 @@ impl App {
     }
 
     fn render(&mut self) {
+        #[cfg(windows)]
+        if self.console.is_some() && self.render_console() {
+            return;
+        }
         let (Some(gfx), Some(ui)) = (&mut self.gfx, &mut self.ui) else { return };
         let (w, h) = self.size;
         if w == 0 || h == 0 || (!ui.has_damage() && ui.stats.presents > 0) {
@@ -445,11 +598,41 @@ impl App {
         for ev in std::mem::take(&mut self.pending) {
             self.apply(ev);
         }
+        if let (Some(key), Some(ui)) = (self.open.take(), &mut self.ui) {
+            ui.open_when_ready(&key);
+        }
         trace(self.t0, "ui built");
+        self.after_input();
         self.render();
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
+    }
+
+    fn console_open(&self) -> bool {
+        #[cfg(windows)]
+        return self.console.is_some();
+        #[cfg(not(windows))]
+        false
+    }
+
+    /// A mouse button over the open console's guest goes to the guest.
+    fn console_takes(&self, button: MouseButton, state: ElementState) -> bool {
+        #[cfg(windows)]
+        if let Some(c) = &self.console {
+            use qorral_display::Button as B;
+            let b = match button {
+                MouseButton::Left => B::Left,
+                MouseButton::Right => B::Right,
+                MouseButton::Middle => B::Middle,
+                MouseButton::Back => B::Side,
+                MouseButton::Forward => B::Extra,
+                MouseButton::Other(_) => return true,
+            };
+            return c.button(b, state == ElementState::Pressed);
+        }
+        let _ = (button, state);
+        false
     }
 
     fn smoke_check(&mut self, el: &ActiveEventLoop) {
@@ -596,6 +779,11 @@ impl ApplicationHandler<UserEvent> for App {
                 let scale = self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor() as f32);
                 if let Some(ui) = &mut self.ui {
                     ui.resize(self.size.0, self.size.1, scale);
+                    #[cfg(windows)]
+                    if let Some(c) = &self.console {
+                        let g = ui.console_guest_rect();
+                        c.resize((sz.width, sz.height), [g.x as f32, g.y as f32, g.w as f32, g.h as f32]);
+                    }
                 }
                 self.after_input();
             }
@@ -606,6 +794,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.after_input();
             }
             WindowEvent::Focused(focused) => {
+                #[cfg(windows)]
+                if !focused && let Some(c) = &mut self.console {
+                    c.release_keys();
+                }
                 let remote = platform::is_remote_session();
                 if let Some(ui) = &mut self.ui {
                     ui.set_active(focused);
@@ -618,6 +810,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as i32, position.y as i32);
+                #[cfg(windows)]
+                if let Some(c) = &mut self.console {
+                    c.pointer(position.x, position.y);
+                }
                 if let Some(ui) = &mut self.ui {
                     ui.pointer_move(self.cursor.0, self.cursor.1);
                 }
@@ -628,6 +824,30 @@ impl ApplicationHandler<UserEvent> for App {
                     ui.pointer_leave();
                 }
                 self.after_input();
+            }
+            WindowEvent::MouseInput { state, button, .. } if self.console_takes(button, state) => {}
+            WindowEvent::MouseWheel { delta, .. } => {
+                #[cfg(windows)]
+                if let Some(c) = &self.console {
+                    let up = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                        MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+                    };
+                    c.wheel(up);
+                }
+                #[cfg(not(windows))]
+                let _ = delta;
+            }
+            WindowEvent::KeyboardInput { event, .. } if self.console_open() => {
+                #[cfg(windows)]
+                if let Some(c) = &mut self.console {
+                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                    if let Some(sc) = event.physical_key.to_scancode() {
+                        c.key(sc, event.state == ElementState::Pressed);
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = event;
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 let (x, y) = self.cursor;
