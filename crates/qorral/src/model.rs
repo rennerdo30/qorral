@@ -27,6 +27,7 @@ pub fn view(entry: &VmEntry, q: Option<&QemuInstall>) -> VmView {
         memory_mib: c.memory_mib,
         disk_gib: c.disk_gib,
         gpu: c.gpu,
+        audio: c.audio,
         uefi: c.firmware == Firmware::Uefi,
         nvme: c.disk_bus == DiskBus::Nvme,
         forwards: c.port_forwards.len(),

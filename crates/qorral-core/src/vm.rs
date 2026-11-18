@@ -93,6 +93,47 @@ impl NetworkMode {
     }
 }
 
+/// The guest's sound card.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioMode {
+    /// No sound card.
+    Off,
+    /// Guest sound plays on the host's default output; no microphone.
+    #[default]
+    Output,
+    /// Output, and the guest may record the host's default microphone.
+    Mic,
+}
+
+impl AudioMode {
+    pub const ALL: [AudioMode; 3] = [AudioMode::Off, AudioMode::Output, AudioMode::Mic];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            AudioMode::Off => "off",
+            AudioMode::Output => "on",
+            AudioMode::Mic => "mic",
+        }
+    }
+
+    /// `off`, `on` (or `output`), `mic`.
+    pub fn parse(s: &str) -> Option<AudioMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "output" => Some(AudioMode::Output),
+            t => AudioMode::ALL.into_iter().find(|m| m.id() == t),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioMode::Off => "No sound",
+            AudioMode::Output => "Sound",
+            AudioMode::Mic => "Sound and microphone",
+        }
+    }
+}
+
 /// A host folder the guest sees through virtio-fs as `<mount>/<name>`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -193,6 +234,8 @@ pub struct VmConfig {
     /// Host folders shared with the guest (virtio-fs, tag `qorral`).
     pub shares: Vec<Share>,
     pub share_cache: ShareCache,
+    /// The sound card (default: sound out, no microphone).
+    pub audio: AudioMode,
     /// Extra QEMU arguments for power users, appended last.
     pub extra_args: Vec<String>,
     /// Disk image outside the machine folder (adopted machines). Default:
@@ -223,6 +266,7 @@ impl Default for VmConfig {
             port_forwards: Vec::new(),
             shares: Vec::new(),
             share_cache: ShareCache::Auto,
+            audio: AudioMode::Output,
             extra_args: Vec::new(),
             disk_path: None,
             efivars_path: None,

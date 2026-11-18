@@ -59,6 +59,7 @@ pub struct VmView {
     pub memory_mib: u32,
     pub disk_gib: u32,
     pub gpu: GpuMode,
+    pub audio: qorral_core::AudioMode,
     pub uefi: bool,
     pub nvme: bool,
     pub forwards: usize,
@@ -1518,6 +1519,7 @@ impl Ui {
             ("Memory", gib(v.memory_mib)),
             ("Disk", format!("{} GB · {}", v.disk_gib, if v.nvme { "NVMe" } else { "virtio" })),
             ("Graphics", v.gpu.label().to_string()),
+            ("Sound", v.audio.label().to_string()),
             ("Firmware", if v.uefi { "UEFI".into() } else { "BIOS".into() }),
             ("Network", if v.forwards == 0 { "NAT".into() } else { format!("NAT · {} forwarded", v.forwards) }),
         ];

@@ -128,6 +128,8 @@ pub struct StartOptions {
     pub gdb: Option<u16>,
     /// Network for this start instead of the saved one.
     pub network: Option<crate::vm::NetworkMode>,
+    /// Sound for this start instead of the saved setting.
+    pub audio: Option<crate::vm::AudioMode>,
     /// Extra shared folders for this start.
     pub shares: Vec<crate::vm::Share>,
 }
@@ -142,6 +144,7 @@ impl Default for StartOptions {
             qemu_args: Vec::new(),
             gdb: None,
             network: None,
+            audio: None,
             shares: Vec::new(),
         }
     }
@@ -155,6 +158,9 @@ pub fn effective_config(saved: &VmConfig, o: &StartOptions) -> VmConfig {
     }
     if let Some(n) = o.network {
         c.network = n;
+    }
+    if let Some(a) = o.audio {
+        c.audio = a;
     }
     c.port_forwards.extend(o.forwards.iter().cloned());
     c.shares.extend(o.shares.iter().cloned());

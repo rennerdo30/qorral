@@ -4,7 +4,7 @@
 //! tested on this QEMU build. One pure function, so every mode is unit-tested
 //! without starting anything.
 
-use crate::vm::{DiskBus, Firmware, GpuMode, NetworkMode, VmConfig};
+use crate::vm::{AudioMode, DiskBus, Firmware, GpuMode, NetworkMode, VmConfig};
 use std::path::{Path, PathBuf};
 
 /// Hardware acceleration per host OS.
@@ -119,7 +119,26 @@ pub fn args(l: &Launch) -> Vec<String> {
         let queues = vm.cpus.clamp(1, MAX_SHARE_QUEUES);
         push(&["-device", &format!("virtio-fs-host-pci,tag={SHARE_TAG},config={config},num-request-queues={queues}")]);
     }
-    push(&["-audiodev", "none,id=snd0"]);
+    // Sound: an Intel HD Audio controller (every guest has a driver) on the
+    // host's default device through DirectSound (Windows) or SDL elsewhere.
+    // Output only unless the machine may use the microphone.
+    // QORRAL_AUDIO_WAV=<file> records the guest's sound instead (tests).
+    let backend = match std::env::var("QORRAL_AUDIO_WAV") {
+        Ok(path) if !path.is_empty() => format!("wav,path={}", path.replace(',', ",,")),
+        _ if cfg!(windows) => "dsound".to_string(),
+        _ => "sdl".to_string(),
+    };
+    match vm.audio {
+        AudioMode::Off => push(&["-audiodev", "none,id=snd0"]),
+        mode => {
+            push(&["-audiodev", &format!("{backend},id=snd0")]);
+            push(&["-device", "ich9-intel-hda"]);
+            push(&[
+                "-device",
+                if mode == AudioMode::Mic { "hda-duplex,audiodev=snd0" } else { "hda-output,audiodev=snd0" },
+            ]);
+        }
+    }
     // A guest-triggered warm reset hangs under WHPX: a guest reboot ends
     // QEMU instead, and Qorral cold-boots the VM again.
     push(&["-no-reboot"]);
@@ -248,6 +267,27 @@ mod tests {
         assert!(has_pair(&a, "-nic", "user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22"));
         assert!(has_pair(&a, "-display", "sdl"));
         assert_eq!(&a[a.len() - 2..], ["-rtc", "base=localtime"]);
+    }
+
+    #[test]
+    fn audio_is_output_only_unless_the_microphone_is_allowed() {
+        if std::env::var_os("QORRAL_AUDIO_WAV").is_some() {
+            return; // a test override of the backend is set in this environment
+        }
+        let backend = if cfg!(windows) { "dsound,id=snd0" } else { "sdl,id=snd0" };
+        let a = launch_args(&VmConfig::default(), Display::Headless);
+        assert!(has_pair(&a, "-audiodev", backend));
+        assert!(has_pair(&a, "-device", "ich9-intel-hda"));
+        assert!(has_pair(&a, "-device", "hda-output,audiodev=snd0"));
+        assert!(!a.iter().any(|x| x.starts_with("hda-duplex")), "no microphone by default");
+        let a = launch_args(&VmConfig { audio: AudioMode::Mic, ..VmConfig::default() }, Display::Headless);
+        assert!(has_pair(&a, "-device", "hda-duplex,audiodev=snd0"));
+        let a = launch_args(&VmConfig { audio: AudioMode::Off, ..VmConfig::default() }, Display::Headless);
+        assert!(has_pair(&a, "-audiodev", "none,id=snd0"));
+        assert!(!a.iter().any(|x| x.contains("intel-hda")), "no sound card when off");
+        assert_eq!(AudioMode::parse("output"), Some(AudioMode::Output));
+        assert_eq!(AudioMode::parse(" MIC "), Some(AudioMode::Mic));
+        assert_eq!(AudioMode::parse("loud"), None);
     }
 
     #[test]

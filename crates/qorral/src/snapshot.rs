@@ -95,6 +95,7 @@ pub fn demo(now: u64) -> Vec<VmView> {
         memory_mib: mem,
         disk_gib: disk,
         gpu,
+        audio: qorral_core::AudioMode::Output,
         uefi: true,
         nvme: os == OsKind::Windows,
         forwards: if id == "fedora" { 1 } else { 0 },

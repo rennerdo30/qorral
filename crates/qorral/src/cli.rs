@@ -26,11 +26,12 @@ usage: qorral [command] [options]      (no command: open the app)
   info <vm>                             settings, state and the QEMU command line
   create <name> [--iso FILE] [--preset ID] [--cpus N] [--memory SIZE] [--disk GB]
                 [--gpu basic|opengl|vulkan|venus] [--bios] [--nvme] [--network MODE]
-                [--forward RULE]... [--qemu-arg ARG]...      (saved with the machine)
+                [--audio off|on|mic] [--forward RULE]... [--qemu-arg ARG]...
+                                        (saved with the machine)
   adopt <name> --image DISK [--efivars FILE] [same options as create]
                                         use an existing disk where it is (no copy)
   start <vm> [--window] [--minutes N] [--iso FILE] [--network MODE] [--forward RULE]...
-             [--share PATH[:ro]]... [--qemu-arg ARG]... [--gdb PORT]
+             [--share PATH[:ro]]... [--audio off|on|mic] [--qemu-arg ARG]... [--gdb PORT]
                                         headless unless --window; options apply to this start only
   stop <vm> [--force] [--timeout S]     ACPI shutdown, or end QEMU at once
   screenshot <vm> <out.png>             the guest screen as PNG
@@ -101,6 +102,7 @@ const VALUED: &[&str] = &[
     "--efivars",
     "--wait-agent",
     "--network",
+    "--audio",
     "--profile",
     "--share",
     "--samples",
@@ -346,6 +348,7 @@ fn entry_json(e: &VmEntry) -> Value {
         "disk_bus": c.disk_bus,
         "iso": c.iso,
         "network": c.network.id(),
+        "audio": c.audio.id(),
         "shares": c.shares,
         "base": c.base,
         "sandbox": sandbox::marker(e).map(|m| json!({ "base": m.base, "keep": m.keep, "created": m.created })),
@@ -464,6 +467,9 @@ fn apply_hardware(c: &mut qorral_core::VmConfig, o: &Opts) -> Result<(), Fail> {
     if let Some(n) = network_opt(o)? {
         c.network = n;
     }
+    if let Some(a) = audio_opt(o)? {
+        c.audio = a;
+    }
     c.port_forwards.extend(o.vals("--forward"));
     c.extra_args.extend(o.vals("--qemu-arg"));
     Ok(())
@@ -515,6 +521,7 @@ fn start(lib: &Library, o: &Opts) -> Result<(), Fail> {
         qemu_args: o.vals("--qemu-arg"),
         gdb,
         network: network_opt(o)?,
+        audio: audio_opt(o)?,
         shares: o.vals("--share").iter().map(|v| qorral_core::Share::parse(v, false)).collect(),
     };
     let run = supervisor::start(lib, &q, &e, &opts).map_err(Fail::Failed)?;
@@ -751,6 +758,14 @@ fn exec(lib: &Library, o: &Opts) -> Result<(), Fail> {
         let _ = std::io::stderr().write_all(out.stderr.as_bytes());
     }
     if out.exit_code == 0 { Ok(()) } else { Err(Fail::Guest(out.exit_code)) }
+}
+
+fn audio_opt(o: &Opts) -> Result<Option<qorral_core::AudioMode>, Fail> {
+    o.val("--audio")
+        .map(|v| {
+            qorral_core::AudioMode::parse(v).ok_or_else(|| Fail::Usage(format!("--audio is off, on or mic, not `{v}`")))
+        })
+        .transpose()
 }
 
 fn network_opt(o: &Opts) -> Result<Option<NetworkMode>, Fail> {
