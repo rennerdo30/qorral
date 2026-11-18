@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
-    AF_UNIX, INVALID_SOCKET, SD_BOTH, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSADATA,
-    WSADuplicateSocketW, WSAPROTOCOL_INFOW, WSAStartup, accept, bind, closesocket, connect, listen, recv, send,
-    shutdown, socket,
+    AF_UNIX, INVALID_SOCKET, SOCK_STREAM, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, WSADATA, WSADuplicateSocketW,
+    WSAPROTOCOL_INFOW, WSAStartup, accept, bind, closesocket, connect, listen, recv, send, socket,
 };
 use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile};
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
@@ -48,15 +47,13 @@ impl Sock {
         self.0.load(Ordering::Acquire)
     }
 
-    /// Closes the socket once; readers and writers on other threads get an error from then on.
+    /// Closes this process's handle once; readers and writers on other threads get an error from
+    /// then on. No `shutdown`: that would also end the connection for a duplicate handed to QEMU.
     pub fn close(&self) {
         let s = self.0.swap(INVALID_SOCKET, Ordering::AcqRel);
         if s != INVALID_SOCKET {
             // SAFETY: the socket was owned and is closed exactly once (the swap above).
-            unsafe {
-                shutdown(s, SD_BOTH);
-                closesocket(s);
-            }
+            unsafe { closesocket(s) };
         }
     }
 

@@ -9,6 +9,8 @@ pub const LISTENER_PATH: &str = "/org/qemu/Display1/Listener";
 pub const LISTENER: &str = "org.qemu.Display1.Listener";
 pub const WIN32_MAP: &str = "org.qemu.Display1.Listener.Win32.Map";
 pub const WIN32_D3D11: &str = "org.qemu.Display1.Listener.Win32.D3d11";
+/// Qorral's QEMU extension: zero-copy scanouts in exported host Vulkan memory.
+pub const WIN32_VULKAN: &str = "org.qemu.Display1.Listener.Win32.VulkanMemory";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const PEER: &str = "org.freedesktop.DBus.Peer";
 const INTROSPECTABLE: &str = "org.freedesktop.DBus.Introspectable";
@@ -21,6 +23,8 @@ pub struct Caps {
     pub map: bool,
     /// Shared Direct3D 11 textures: `ScanoutTexture` / `UpdateTexture`.
     pub d3d11: bool,
+    /// Exported host Vulkan memory (Qorral's QEMU): `ScanoutBlob` / `FlipBlob` / `ForgetBlob`.
+    pub vulkan: bool,
 }
 
 impl Caps {
@@ -31,6 +35,9 @@ impl Caps {
         }
         if self.d3d11 {
             v.push(WIN32_D3D11);
+        }
+        if self.vulkan {
+            v.push(WIN32_VULKAN);
         }
         v
     }
@@ -64,6 +71,30 @@ pub enum Event<'a> {
     },
     /// A changed rectangle of the current shared texture.
     UpdateTexture { x: i32, y: i32, width: i32, height: i32 },
+    /// A guest scanout buffer in host Vulkan memory, to import once (zero copy): an NT handle
+    /// (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT`, owned by the receiver) to the whole
+    /// allocation, imported with exactly `allocation_size` and `memory_type_index` on the device
+    /// whose `deviceUUID` is `device_uuid`. The pixels start at `offset`, `stride` bytes per row.
+    /// `dedicated` allocations are read through a buffer. Sent again when the layout changes.
+    ScanoutBlob {
+        resource_id: u32,
+        handle: u64,
+        allocation_size: u64,
+        memory_type_index: u32,
+        dedicated: bool,
+        device_uuid: [u8; 16],
+        driver_uuid: [u8; 16],
+        offset: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: u32,
+    },
+    /// Buffer `resource_id` is shown now; the rectangle changed. 0: blob scanouts ended, the
+    /// other events carry the display again.
+    FlipBlob { resource_id: u32, x: i32, y: i32, width: i32, height: i32 },
+    /// The guest freed this buffer: release its import.
+    ForgetBlob { resource_id: u32 },
     /// The display is off (for example the guest blanked it).
     Disable,
     /// The guest pointer's position and visibility.
@@ -182,6 +213,33 @@ fn dispatch(call: &Message, caps: Caps, on_event: &mut dyn FnMut(Event<'_>)) -> 
             width: r.u32().map_err(bad)?,
             height: r.u32().map_err(bad)?,
         },
+        (WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu") if caps.vulkan => {
+            let uuid = |r: &mut Reader<'_>| -> Result<[u8; 16], CallError> {
+                r.bytes().map_err(bad)?.try_into().map_err(|_| INVALID_ARGS)
+            };
+            Event::ScanoutBlob {
+                resource_id: r.u32().map_err(bad)?,
+                handle: r.u64().map_err(bad)?,
+                allocation_size: r.u64().map_err(bad)?,
+                memory_type_index: r.u32().map_err(bad)?,
+                dedicated: r.u32().map_err(bad)? & 1 != 0,
+                device_uuid: uuid(&mut r)?,
+                driver_uuid: uuid(&mut r)?,
+                offset: r.u64().map_err(bad)?,
+                width: r.u32().map_err(bad)?,
+                height: r.u32().map_err(bad)?,
+                stride: r.u32().map_err(bad)?,
+                format: r.u32().map_err(bad)?,
+            }
+        }
+        (WIN32_VULKAN, "FlipBlob", "uiiii") if caps.vulkan => Event::FlipBlob {
+            resource_id: r.u32().map_err(bad)?,
+            x: r.i32().map_err(bad)?,
+            y: r.i32().map_err(bad)?,
+            width: r.i32().map_err(bad)?,
+            height: r.i32().map_err(bad)?,
+        },
+        (WIN32_VULKAN, "ForgetBlob", "u") if caps.vulkan => Event::ForgetBlob { resource_id: r.u32().map_err(bad)? },
         (WIN32_D3D11, "UpdateTexture2d", "iiii") if caps.d3d11 => Event::UpdateTexture {
             x: r.i32().map_err(bad)?,
             y: r.i32().map_err(bad)?,
@@ -209,7 +267,7 @@ mod tests {
 
     #[test]
     fn properties_announce_the_offered_interfaces() {
-        let caps = Caps { map: true, d3d11: false };
+        let caps = Caps { map: true, d3d11: false, vulkan: false };
         let reply = handle(&call(PROPERTIES, "GetAll", "s", |w| w.str(LISTENER)), caps, &mut |_| {}).unwrap();
         assert_eq!((reply.kind, reply.reply_serial, reply.signature.as_str()), (METHOD_RETURN, Some(3), "a{sv}"));
         let len = Reader::new(&reply.body).u32().unwrap() as usize;
@@ -235,7 +293,7 @@ mod tests {
 
     #[test]
     fn display_calls_become_events_and_get_a_reply() {
-        let caps = Caps { map: true, d3d11: true };
+        let caps = Caps { map: true, d3d11: true, vulkan: false };
         let mut seen = Vec::new();
         let m = call(WIN32_MAP, "ScanoutMap", "tuuuuu", |w| {
             w.u64(0x1234);
@@ -266,6 +324,45 @@ mod tests {
             seen,
             ["ScanoutMap { handle: 4660, offset: 0, width: 1280, height: 800, stride: 5120, format: 537004168 }"]
         );
+    }
+
+    #[test]
+    fn zero_copy_blob_calls_become_events() {
+        let caps = Caps { vulkan: true, ..Caps::default() };
+        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu", |w| {
+            w.u32(7);
+            w.u64(0xabc);
+            w.u64(16 << 20);
+            w.u32(3);
+            w.u32(1);
+            w.bytes(&[1; 16]);
+            w.bytes(&[2; 16]);
+            w.u64(4096);
+            w.u32(1280);
+            w.u32(800);
+            w.u32(5120);
+            w.u32(0x2002_0888);
+        });
+        let mut got = None;
+        handle(&m, caps, &mut |e| got = Some(format!("{e:?}")));
+        let got = got.expect("an event");
+        assert!(got.starts_with("ScanoutBlob { resource_id: 7, handle: 2748, allocation_size: 16777216, memory_type_index: 3, dedicated: true"));
+        assert!(got.ends_with("offset: 4096, width: 1280, height: 800, stride: 5120, format: 537004168 }"));
+        let m = call(WIN32_VULKAN, "FlipBlob", "uiiii", |w| {
+            w.u32(7);
+            (0..4).for_each(|i| w.i32(i));
+        });
+        handle(&m, caps, &mut |e| assert_eq!(e, Event::FlipBlob { resource_id: 7, x: 0, y: 1, width: 2, height: 3 }));
+        // A UUID of the wrong length is refused.
+        let m = call(WIN32_VULKAN, "ScanoutBlob", "uttuuayaytuuuu", |w| {
+            w.u32(7);
+            w.u64(1);
+            w.u64(1);
+            w.u32(0);
+            w.u32(0);
+            w.bytes(&[1; 15]);
+        });
+        assert_eq!(handle(&m, caps, &mut |_| panic!("no event")).unwrap().kind, ERROR);
     }
 
     #[test]
