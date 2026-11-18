@@ -60,6 +60,37 @@ pub struct LatencySample {
     /// Probe pixel brightness (0-255) before the key and at the last update read.
     pub before: u8,
     pub after: u8,
+    /// Where the time went, from QEMU builds that mark the stages (`None` from older builds).
+    pub stages: Option<LatencyStages>,
+}
+
+/// Stage marks of one measurement, in microseconds after the key press (0 = not seen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyStages {
+    /// The guest first read from the keyboard device.
+    pub key_read_us: u64,
+    /// The guest's first present (a scanout flush or flip) after the key.
+    pub first_present_us: u64,
+    /// The guest's last present before the display update that carried the change.
+    pub present_us: u64,
+    /// That display update started (before QEMU's display listeners ran).
+    pub update_start_us: u64,
+    /// Presents (scanout flushes and flips) while waiting.
+    pub presents: u64,
+}
+
+impl LatencyStages {
+    /// The four spans of a measurement that ended at `elapsed_us`, when every mark was seen in
+    /// order: key into QEMU to the guest reading it, the guest (input stack, app, rendering and
+    /// presentation) up to its present, the host GPU path to the display update, and the display
+    /// listeners.
+    pub fn spans(&self, elapsed_us: u64) -> Option<[u64; 4]> {
+        let marks = [0, self.key_read_us, self.present_us, self.update_start_us, elapsed_us];
+        if marks[1..].contains(&0) || marks.windows(2).any(|w| w[1] < w[0]) {
+            return None;
+        }
+        Some([marks[1], marks[2] - marks[1], marks[3] - marks[2], marks[4] - marks[3]])
+    }
 }
 
 impl Qmp {
@@ -167,6 +198,16 @@ impl Qmp {
             timed_out: d["timed-out"].as_bool().unwrap_or(true),
             before: byte(&d["before"]),
             after: byte(&d["after"]),
+            stages: d.get("update-start-us").map(|_| {
+                let us = |k: &str| d[k].as_u64().unwrap_or(0);
+                LatencyStages {
+                    key_read_us: us("key-read-us"),
+                    first_present_us: us("first-present-us"),
+                    present_us: us("present-us"),
+                    update_start_us: us("update-start-us"),
+                    presents: us("presents"),
+                }
+            }),
         })
     }
 
@@ -272,9 +313,46 @@ mod tests {
         ]);
         let mut q = Qmp::connect(port, Duration::from_secs(5)).unwrap();
         let s = q.latency_probe("spc", Duration::from_secs(1)).unwrap();
-        assert_eq!(s, LatencySample { elapsed_us: 4210, updates: 3, timed_out: false, before: 0, after: 255 });
+        assert_eq!(
+            s,
+            LatencySample { elapsed_us: 4210, updates: 3, timed_out: false, before: 0, after: 255, stages: None }
+        );
         assert_eq!(q.events.len(), 1, "the unrelated event is kept");
         let sent = h.join().unwrap();
         assert!(sent[1].contains("x-qorral-latency-probe") && sent[1].contains("\"spc\""));
+    }
+
+    #[test]
+    fn latency_probe_reads_the_stage_marks() {
+        let (port, h) = fake_qemu(vec![
+            "{\"return\": {}}
+",
+            "{\"return\": {}}
+{\"event\": \"QORRAL_LATENCY\", \"data\": {\"elapsed-us\": 9000, \"updates\": 2, \"timed-out\": false, \
+             \"before\": 0, \"after\": 255, \"key-read-us\": 300, \"first-present-us\": 2000, \"present-us\": 6000, \
+             \"update-start-us\": 8000, \"presents\": 2}}
+",
+        ]);
+        let mut q = Qmp::connect(port, Duration::from_secs(5)).unwrap();
+        let s = q.latency_probe("spc", Duration::from_secs(1)).unwrap();
+        let st = s.stages.expect("stage marks");
+        assert_eq!((st.key_read_us, st.first_present_us, st.presents), (300, 2000, 2));
+        assert_eq!(st.spans(s.elapsed_us), Some([300, 5700, 2000, 1000]));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn latency_spans_need_every_mark_in_order() {
+        let st =
+            LatencyStages { key_read_us: 300, first_present_us: 0, present_us: 0, update_start_us: 800, presents: 0 };
+        assert_eq!(st.spans(900), None, "no present seen");
+        let st = LatencyStages {
+            key_read_us: 300,
+            first_present_us: 500,
+            present_us: 900,
+            update_start_us: 800,
+            presents: 1,
+        };
+        assert_eq!(st.spans(1000), None, "present after the update");
     }
 }

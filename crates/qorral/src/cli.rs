@@ -595,6 +595,8 @@ fn latency(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let key = o.val("--key").unwrap_or("spc");
     let mut q = connect(&e)?;
     let mut ms: Vec<f64> = Vec::new();
+    // Per stage (see LatencyStages::spans), in ms, from samples where every mark was seen.
+    let mut spans: [Vec<f64>; 4] = Default::default();
     let mut timeouts = 0u64;
     for i in 0..samples {
         if i > 0 {
@@ -603,10 +605,27 @@ fn latency(lib: &Library, o: &Opts) -> Result<(), Fail> {
         let s = q.latency_probe(key, Duration::from_secs(2)).map_err(|err| Fail::Failed(err.to_string()))?;
         if s.timed_out {
             timeouts += 1;
-        } else {
-            ms.push(s.elapsed_us as f64 / 1000.0);
+            continue;
+        }
+        ms.push(s.elapsed_us as f64 / 1000.0);
+        if let Some(sp) = s.stages.and_then(|st| st.spans(s.elapsed_us)) {
+            for (list, us) in spans.iter_mut().zip(sp) {
+                list.push(us as f64 / 1000.0);
+            }
         }
     }
+    const STAGES: [(&str, &str); 4] = [
+        ("input_ms", "key to guest read"),
+        ("guest_ms", "guest to present"),
+        ("host_gpu_ms", "present to display update"),
+        ("display_ms", "display listeners"),
+    ];
+    let median = |v: &[f64]| {
+        let mut s = v.to_vec();
+        s.sort_by(f64::total_cmp);
+        s.get(s.len().saturating_sub(1) / 2).copied()
+    };
+    let stage_medians: Vec<Option<f64>> = spans.iter().map(|v| median(v)).collect();
     if ms.is_empty() {
         return Err(Fail::Failed(format!(
             "the screen did not change after any of {samples} key presses: run `qorral-bench --scene latency` in \
@@ -618,10 +637,14 @@ fn latency(lib: &Library, o: &Opts) -> Result<(), Fail> {
     let at = |q: f64| sorted[((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len()) - 1];
     let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
     if o.json {
+        let mut stages = serde_json::Map::new();
+        for ((key, _), (m, values)) in STAGES.iter().zip(stage_medians.iter().zip(&spans)) {
+            stages.insert(key.to_string(), json!({ "median": m, "values": values }));
+        }
         print_json(json!({
             "samples": ms.len(), "timeouts": timeouts, "key": key,
             "median_ms": at(0.5), "p90_ms": at(0.9), "min_ms": sorted[0], "max_ms": sorted[sorted.len() - 1],
-            "mean_ms": mean, "values_ms": ms,
+            "mean_ms": mean, "values_ms": ms, "stages": stages, "staged_samples": spans[0].len(),
         }));
     } else {
         println!(
@@ -635,6 +658,14 @@ fn latency(lib: &Library, o: &Opts) -> Result<(), Fail> {
             ms.len(),
             if timeouts > 0 { format!(", {timeouts} timed out") } else { String::new() }
         );
+        if !spans[0].is_empty() {
+            let parts: Vec<String> = STAGES
+                .iter()
+                .zip(&stage_medians)
+                .filter_map(|((_, label), m)| m.map(|m| format!("{label} {m:.2}")))
+                .collect();
+            println!("  stage medians, ms ({} samples): {}", spans[0].len(), parts.join(", "));
+        }
     }
     Ok(())
 }
